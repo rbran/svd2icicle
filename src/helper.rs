@@ -1,84 +1,71 @@
-use std::ops::Range;
+use proc_macro2::{Ident, TokenStream};
+use quote::{format_ident, quote, ToTokens};
 
-use svd_parser::svd::Peripheral;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MemoryPage {
-    pub addr: u64,
-    pub chunks: Vec<MemoryChunk>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MemoryChunk(pub Range<u64>);
-
-/// create a page-mapped list of peripherals
-/// TODO check that each page is aligned
-pub fn memory_pages_from_chunks<'a>(
-    addr_bits: u32,
-    peripherals: &[Peripheral],
-) -> Vec<MemoryPage> {
-    let page_mask = (u64::MAX >> addr_bits) << addr_bits;
-    let mut chunks = Vec::new();
-    for per in peripherals.iter() {
-        for reg in per.all_registers() {
-            let start = per.base_address + reg.address_offset as u64;
-            let bits = reg
-                .properties
-                .size
-                .or(per.default_register_properties.size)
-                .unwrap();
-            match reg {
-                svd_parser::svd::MaybeArray::Single(_reg) => {
-                    let end = start + (bits as u64 / 8);
-                    // don't allow register between pages
-                    assert_eq!(
-                        start & page_mask,
-                        (end - 1) & page_mask,
-                        "reg start {start} end {end}"
-                    );
-                    chunks.push(MemoryChunk(start..end))
-                }
-                svd_parser::svd::MaybeArray::Array(_reg, dim) => {
-                    let mut start = start;
-                    for _ in 0..dim.dim {
-                        let end = start + (bits as u64 / 8);
-                        chunks.push(MemoryChunk(start..end));
-
-                        start += dim.dim_increment as u64;
-                    }
-                }
-            }
+pub fn read_write_field(
+    dim: u32,
+    read: Option<&Ident>,
+    write: Option<&Ident>,
+    bytes: u32,
+    tokens: &mut TokenStream,
+) {
+    let dim = (dim != 0).then(|| quote! {_dim: usize});
+    if bytes == 1 {
+        if let Some(read) = read {
+            tokens.extend(quote! { pub fn #read(&self, #dim) -> u8 { todo!() } })
+        }
+        if let Some(write) = write.as_ref() {
+            tokens.extend(quote! {
+                pub fn #write(&self, _value: u8, #dim) { todo!() }
+            })
+        }
+    } else {
+        let params: Box<[_]> = (0..bytes)
+            .into_iter()
+            .map(|i| format_ident!("_byte_{}", i))
+            .collect();
+        if let Some(read) = read.as_ref() {
+            let body = read_write_generic_body(&params);
+            let declare_params =
+                dim.clone().into_iter().chain(params.iter().map(|param| {
+                    quote! { #param: &mut Option<&mut u8> }
+                }));
+            tokens.extend(quote! {
+                pub fn #read(&self, #(#declare_params),*) { #body }
+            });
+        }
+        if let Some(write) = write.as_ref() {
+            let body = read_write_generic_body(&params);
+            let declare_params =
+                dim.into_iter().chain(params.iter().map(|param| {
+                    quote! { #param: Option<&u8> }
+                }));
+            tokens.extend(quote! {
+                pub fn #write(&self, #(#declare_params),*) { #body }
+            });
         }
     }
-    // sort chunks so lowest address comes first, also but biggest first to
-    // optimize the algorithm below.
-    chunks.sort_unstable_by(|a, b| match a.0.start.cmp(&b.0.start) {
-        std::cmp::Ordering::Equal => b.0.end.cmp(&a.0.end),
-        x => x,
-    });
+}
 
-    // combine multiple chunks into pages
-    chunks.into_iter().fold(vec![], |mut pages, chunk| {
-        // if overlapping with the last page, just accumulate. Otherwise
-        // start a new page
-        let chunk_page = chunk.0.start & page_mask;
-        match pages.last_mut() {
-            // if it belongs to the same page, add this chunk to the last page
-            Some(last) if last.addr == chunk_page => {
-                // merge the chunks if they are intersecting/sequential
-                match last.chunks.last_mut() {
-                    Some(last) if last.0.end >= chunk.0.start => {
-                        last.0.end = last.0.end.max(chunk.0.end)
-                    }
-                    _ => last.chunks.push(chunk),
-                }
-            }
-            // start a new page
-            _ => pages.push(MemoryPage {
-                addr: chunk_page,
-                chunks: vec![chunk],
-            }),
+pub fn read_write_generic_body<'a>(params: &'a [Ident]) -> impl ToTokens + 'a {
+    struct Idents<'a>(&'a [Ident]);
+    impl ToTokens for Idents<'_> {
+        fn to_tokens(&self, tokens: &mut TokenStream) {
+            let params = &self.0;
+            let none_params = params.iter().map(|_| {
+                quote! { None }
+            });
+            let some_params = params.iter().map(|param| {
+                quote! { Some(#param) }
+            });
+            tokens.extend(quote! {
+                let (#(#params),*) = match (#(#params),*) {
+                    (#(#none_params),*) => unreachable!(),
+                    (#(#some_params),*) => (#(#params),*),
+                    _ => todo!(),
+                };
+                todo!();
+            });
         }
-        pages
-    })
+    }
+    Idents(params)
 }
