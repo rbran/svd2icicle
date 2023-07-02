@@ -43,13 +43,39 @@ impl MemoryPage {
             }
         });
         let write = self.chunks.iter().map(move |chunk| {
-            let start = Literal::u64_unsuffixed(chunk.0.start - self.addr);
-            let startp1 =
-                Literal::u64_unsuffixed((chunk.0.start + 1) - self.addr);
-            let endm1 = Literal::u64_unsuffixed((chunk.0.end - 1) - self.addr);
-            let end = Literal::u64_unsuffixed(chunk.0.end - self.addr);
+            let start = chunk.0.start - self.addr;
+            let end = chunk.0.end - self.addr;
+            let range = chunk.0.start..chunk.0.end;
+            let registers = peripherals.registers.iter()
+            .filter(|(addr, _reg)| range.contains(addr))
+            .filter_map(|(addr, reg)| {
+                let reg_start = *addr - self.addr;
+                let reg_end = reg_start + (reg.bits / 8) as u64;
+                let bytes = (reg_start..reg_end).into_iter().map(|byte| {
+                    let byte = Literal::u64_unsuffixed(byte as u64);
+                    quote!{if #byte >= _start {_buf.get((#byte - _start) as usize)} else { None }}
+                });
+                let reg_start = Literal::u64_unsuffixed(reg_start);
+                let reg_end = Literal::u64_unsuffixed(reg_end);
+                let reg_fun = if let Some(fun) = reg.write_fun.as_ref() {
+                    quote!{ self.#fun(#(#bytes),*); }
+                } else {
+                    quote!{ return Err(icicle_vm::cpu::mem::MemError::WriteViolation); }
+                };
+                Some(quote! {
+                    if (_start >= #reg_start && _start < #reg_end) || (_end > #reg_start && _end <= #reg_end) {
+                        #reg_fun
+                    }
+                })
+            });
+            let startp1 = Literal::u64_unsuffixed(start + 1);
+            let start = Literal::u64_unsuffixed(start);
+            let endm1 = Literal::u64_unsuffixed(end - 1);
+            let end = Literal::u64_unsuffixed(end);
             quote! {
-                (#start..=#endm1, #startp1..=#end) => todo!(),
+                (#start..=#endm1, #startp1..=#end) => {
+                    #(#registers)*
+                },
             }
         });
         let register_functions =
@@ -84,6 +110,7 @@ impl MemoryPage {
                         #(#write)*
                         _ => Err(icicle_vm::cpu::mem::MemError::Unmapped),
                     }
+                    Ok(())
                 }
             }
             impl #pseudo_struct {
