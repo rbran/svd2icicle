@@ -1,4 +1,4 @@
-use proc_macro2::Ident;
+use proc_macro2::{Ident, Literal};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::{Name, Register};
 
@@ -97,14 +97,14 @@ impl<'a> RegisterFunctions<'a> {
                     let lsb = field.field.lsb();
                     let dim = (self.dim != 0).then(|| quote! {_dim});
                     Some(quote! {
-                        self.0.lock().unwrap().#per_mod.#field_fun(#dim) << #lsb
+                        self.0.lock().unwrap().#per_mod.#field_fun(#dim)? << #lsb
                     })
                 });
                 let dim = dim.clone();
-                tokens.extend(quote! { pub fn #read(&self, #dim) -> u8 {
+                tokens.extend(quote! { pub fn #read(&self, #dim) ->  -> icicle_vm::cpu::mem::MemResult<u8> {
                     let mut _value = 0;
                     #(_value |= #fields;)*
-                    value
+                    Ok(value)
                 } })
             }
             if let Some(write) = self.write_fun.as_ref() {
@@ -121,13 +121,14 @@ impl<'a> RegisterFunctions<'a> {
                         self.0.lock().unwrap().#per_mod.#field_fun(
                             #(#dim,)*
                             (_value >> #lsb) #mask
-                        );
+                        )?;
                     })
                 });
                 let dim = dim.into_iter();
                 tokens.extend(quote! {
-                    pub fn #write(&self, #(#dim,)* _value: u8) {
+                    pub fn #write(&self, #(#dim,)* _value: u8) -> icicle_vm::cpu::mem::MemResult<()> {
                         #(#fields)*
+                        Ok(())
                     }
                 })
             }
@@ -154,7 +155,7 @@ impl<'a> RegisterFunctions<'a> {
                             let dim = (self.dim != 0).then(|| quote!{_dim});
                             Some(quote! {
                                 if let Some(byte) = &mut #bytes_match {
-                                    **byte |= self.0.lock().unwrap().#per_mod.#field_fun(#dim) << #lsb;
+                                    **byte |= self.0.lock().unwrap().#per_mod.#field_fun(#dim)? << #lsb;
                                 }
                             })
                         },
@@ -163,16 +164,17 @@ impl<'a> RegisterFunctions<'a> {
                             let params = &params[first_byte..last_byte];
                             let dim = (self.dim != 0).then(|| quote!{_dim}).into_iter();
                             Some(quote! {
-                                if #(#params.is_some())|* {
-                                    self.0.lock().unwrap().#per_mod.#field_fun(#(#dim,)* #(&mut #params,)*);
+                                if #(#params.is_some())||* {
+                                    self.0.lock().unwrap().#per_mod.#field_fun(#(#dim,)* #(&mut #params,)*)?;
                                 }
                             })
                         },
                     }
                 });
                 tokens.extend(quote! {
-                    pub fn #read(&self, #(#declare_params),*) {
+                    pub fn #read(&self, #(#declare_params),*) -> icicle_vm::cpu::mem::MemResult<()> {
                         #(#fields)*
+                        Ok(())
                     }
                 });
             }
@@ -181,9 +183,40 @@ impl<'a> RegisterFunctions<'a> {
                     dim.into_iter().chain(params.iter().map(|param| {
                         quote! { #param: Option<&u8> }
                     }));
+                let fields = self.fields.iter().filter_map(|field| {
+                    let field_fun = field.write.as_ref()?;
+                    let per_mod = &peripherals.peripheral_structs
+                        [field.peripheral_index]
+                        .mod_name;
+                    let lsb = field.field.lsb();
+                    let first_byte = (lsb / 8) as usize;
+                    let dim = (self.dim != 0).then(|| quote!{_dim}).into_iter();
+                    match field.data {
+                        crate::field::FieldData::Single(_bits) => {
+                            let bytes_match = &params[first_byte];
+                            let mask = Literal::u8_unsuffixed(u8::MAX >> (u8::BITS - field.field.bit_width()));
+                            let lsb = Literal::u32_unsuffixed(lsb);
+                            Some(quote! {
+                                if let Some(byte) = #bytes_match {
+                                    self.0.lock().unwrap().#per_mod.#field_fun(#(#dim,)* (*byte >> #lsb) & #mask)?;
+                                }
+                            })
+                        },
+                        crate::field::FieldData::Multiple { first, bytes, last } => {
+                            let last_byte = first_byte + (first != 0) as usize + (last != 0) as usize + bytes as usize;
+                            let params = &params[first_byte..last_byte];
+                            Some(quote! {
+                                if #(#params.is_some())||* {
+                                    self.0.lock().unwrap().#per_mod.#field_fun(#(#dim,)* #(#params,)*)?;
+                                }
+                            })
+                        },
+                    }
+                });
                 tokens.extend(quote! {
-                    pub fn #write(&self, #(#declare_params),*) {
-                        todo!()
+                    pub fn #write(&self, #(#declare_params),*) -> icicle_vm::cpu::mem::MemResult<()> {
+                        #(#fields)*
+                        Ok(())
                     }
                 });
             }

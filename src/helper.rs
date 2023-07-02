@@ -11,12 +11,16 @@ pub fn read_write_field(
     let dim = (dim != 0).then(|| quote! {_dim: usize});
     if bytes == 1 {
         if let Some(read) = read {
-            tokens.extend(quote! { pub fn #read(&self, #dim) -> u8 { todo!() } })
+            tokens.extend(quote! { pub fn #read(&self, #dim) -> icicle_vm::cpu::mem::MemResult<u8> {
+                todo!()
+            }})
         }
         if let Some(write) = write.as_ref() {
+            let dim = dim.into_iter();
             tokens.extend(quote! {
-                pub fn #write(&self, _value: u8, #dim) { todo!() }
-            })
+                pub fn #write(&self, #(#dim,)* _value: u8) -> icicle_vm::cpu::mem::MemResult<()> {
+                    todo!()
+            }})
         }
     } else {
         let params: Box<[_]> = (0..bytes)
@@ -30,7 +34,9 @@ pub fn read_write_field(
                     quote! { #param: &mut Option<&mut u8> }
                 }));
             tokens.extend(quote! {
-                pub fn #read(&self, #(#declare_params),*) { #body }
+                pub fn #read(&self, #(#declare_params),*) -> icicle_vm::cpu::mem::MemResult<()> {
+                    #body
+                }
             });
         }
         if let Some(write) = write.as_ref() {
@@ -40,7 +46,9 @@ pub fn read_write_field(
                     quote! { #param: Option<&u8> }
                 }));
             tokens.extend(quote! {
-                pub fn #write(&self, #(#declare_params),*) { #body }
+                pub fn #write(&self, #(#declare_params),*) -> icicle_vm::cpu::mem::MemResult<()> {
+                    #body
+                }
             });
         }
     }
