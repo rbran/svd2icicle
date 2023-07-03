@@ -1,8 +1,8 @@
-use proc_macro2::{Ident, Literal};
+use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::{Name, Register};
 
-use crate::field::FieldAccess;
+use crate::field::{FieldAccess, FieldData};
 use crate::formater::{dim_to_n, snake_case};
 use crate::peripheral::Peripherals;
 
@@ -46,6 +46,7 @@ impl<'a> RegisterFunctions<'a> {
             fields: vec![],
         }
     }
+
     pub fn add(&mut self, size: u32, per_i: usize, reg: &'a Register) {
         #[cfg(debug_assertions)]
         if let Some(last) = self.regs.last() {
@@ -65,6 +66,7 @@ impl<'a> RegisterFunctions<'a> {
             self.fields.push(field);
         }
     }
+
     pub fn functions<'b>(
         &'b self,
         peripherals: &'b Peripherals,
@@ -80,12 +82,14 @@ impl<'a> RegisterFunctions<'a> {
         }
         Tokens(self, peripherals)
     }
+
     fn gen_functions(
         &self,
         peripherals: &Peripherals,
         tokens: &mut proc_macro2::TokenStream,
     ) {
-        let dim = (self.dim != 0).then(|| quote! {_dim: usize});
+        let dim_declare = (self.dim != 0).then(|| quote! {_dim: usize,});
+        let dim_use = (self.dim != 0).then(|| quote! {_dim,});
         let bytes = (self.bits + 7) / 8;
         if bytes == 1 {
             if let Some(read) = self.read_fun.as_ref() {
@@ -95,17 +99,25 @@ impl<'a> RegisterFunctions<'a> {
                         [field.peripheral_index]
                         .mod_name;
                     let lsb = field.field.lsb();
-                    let dim = (self.dim != 0).then(|| quote! {_dim});
                     Some(quote! {
-                        self.0.lock().unwrap().#per_mod.#field_fun(#dim)? << #lsb
+                        self
+                            .0
+                            .lock()
+                            .unwrap()
+                            .#per_mod
+                            .#field_fun(#dim_use)? << #lsb;
                     })
                 });
-                let dim = dim.clone();
-                tokens.extend(quote! { pub fn #read(&self, #dim) ->  -> icicle_vm::cpu::mem::MemResult<u8> {
-                    let mut _value = 0;
-                    #(_value |= #fields;)*
-                    Ok(value)
-                } })
+                tokens.extend(quote! {
+                    pub fn #read(
+                        &self,
+                        #dim_declare
+                    ) -> icicle_vm::cpu::mem::MemResult<u8> {
+                        let mut _value = 0;
+                        #(_value |= #fields)*
+                        Ok(value)
+                    }
+                })
             }
             if let Some(write) = self.write_fun.as_ref() {
                 let fields = self.fields.iter().filter_map(|field| {
@@ -124,9 +136,12 @@ impl<'a> RegisterFunctions<'a> {
                         )?;
                     })
                 });
-                let dim = dim.into_iter();
                 tokens.extend(quote! {
-                    pub fn #write(&self, #(#dim,)* _value: u8) -> icicle_vm::cpu::mem::MemResult<()> {
+                    pub fn #write(
+                        &self,
+                        #dim_declare
+                        _value: u8
+                    ) -> icicle_vm::cpu::mem::MemResult<()> {
                         #(#fields)*
                         Ok(())
                     }
@@ -138,87 +153,131 @@ impl<'a> RegisterFunctions<'a> {
                 .map(|i| format_ident!("_byte_{}", i))
                 .collect();
             if let Some(read) = self.read_fun.as_ref() {
-                let declare_params =
-                    dim.clone().into_iter().chain(params.iter().map(|param| {
-                        quote! { mut #param: Option<&mut u8> }
-                    }));
+                let declare_params = params.iter().map(|param| {
+                    quote! { mut #param: Option<&mut u8> }
+                });
                 let fields = self.fields.iter().filter_map(|field| {
-                    let field_fun = field.read.as_ref()?;
-                    let per_mod = &peripherals.peripheral_structs
-                        [field.peripheral_index]
-                        .mod_name;
-                            let lsb = field.field.lsb();
-                            let first_byte = (lsb / 8) as usize;
-                    match field.data {
-                        crate::field::FieldData::Single(_bits) => {
-                            let bytes_match = &params[first_byte];
-                            let dim = (self.dim != 0).then(|| quote!{_dim});
-                            Some(quote! {
-                                if let Some(byte) = &mut #bytes_match {
-                                    **byte |= self.0.lock().unwrap().#per_mod.#field_fun(#dim)? << #lsb;
-                                }
-                            })
+                    self.gen_field_register(
+                        peripherals,
+                        &params,
+                        field.read.as_ref()?,
+                        field,
+                        |byte_match, per_mod, field_fun, lsb| quote! {
+                            if let Some(byte) = &mut #byte_match {
+                                **byte |= self
+                                    .0
+                                    .lock()
+                                    .unwrap()
+                                    .#per_mod
+                                    .#field_fun(#dim_use)? << #lsb;
+                            }
                         },
-                        crate::field::FieldData::Multiple { first, bytes, last } => {
-                            let last_byte = first_byte + (first != 0) as usize + (last != 0) as usize + bytes as usize;
-                            let params = &params[first_byte..last_byte];
-                            let dim = (self.dim != 0).then(|| quote!{_dim}).into_iter();
-                            Some(quote! {
-                                if #(#params.is_some())||* {
-                                    self.0.lock().unwrap().#per_mod.#field_fun(#(#dim,)* #(&mut #params,)*)?;
-                                }
-                            })
-                        },
-                    }
+                        |per_mod, field_fun, params| quote! {
+                            if #(#params.is_some())||* {
+                                self
+                                    .0
+                                    .lock()
+                                    .unwrap()
+                                    .#per_mod
+                                    .#field_fun(#dim_use #(&mut #params),*)?;
+                            }
+                        }
+                    )
                 });
                 tokens.extend(quote! {
-                    pub fn #read(&self, #(#declare_params),*) -> icicle_vm::cpu::mem::MemResult<()> {
+                    pub fn #read(
+                        &self,
+                        #(#declare_params),*
+                    ) -> icicle_vm::cpu::mem::MemResult<()> {
                         #(#fields)*
                         Ok(())
                     }
                 });
             }
             if let Some(write) = self.write_fun.as_ref() {
-                let declare_params =
-                    dim.into_iter().chain(params.iter().map(|param| {
-                        quote! { #param: Option<&u8> }
-                    }));
+                let declare_params = params.iter().map(|param| {
+                    quote! { #param: Option<&u8> }
+                });
                 let fields = self.fields.iter().filter_map(|field| {
-                    let field_fun = field.write.as_ref()?;
-                    let per_mod = &peripherals.peripheral_structs
-                        [field.peripheral_index]
-                        .mod_name;
-                    let lsb = field.field.lsb();
-                    let first_byte = (lsb / 8) as usize;
-                    let dim = (self.dim != 0).then(|| quote!{_dim}).into_iter();
-                    match field.data {
-                        crate::field::FieldData::Single(_bits) => {
-                            let bytes_match = &params[first_byte];
-                            let mask = Literal::u8_unsuffixed(u8::MAX >> (u8::BITS - field.field.bit_width()));
-                            let lsb = Literal::u32_unsuffixed(lsb);
-                            Some(quote! {
-                                if let Some(byte) = #bytes_match {
-                                    self.0.lock().unwrap().#per_mod.#field_fun(#(#dim,)* (*byte >> #lsb) & #mask)?;
+                    let mask = Literal::u8_unsuffixed(
+                        u8::MAX >> (u8::BITS - field.field.bit_width()),
+                    );
+                    self.gen_field_register(
+                        peripherals,
+                        &params,
+                        field.write.as_ref()?,
+                        field,
+                        |byte_match, per_mod, field_fun, lsb| {
+                            quote! {
+                                if let Some(byte) = #byte_match {
+                                    self
+                                        .0
+                                        .lock()
+                                        .unwrap()
+                                        .#per_mod
+                                        .#field_fun(
+                                            #dim_use (*byte >> #lsb) & #mask
+                                        )?;
                                 }
-                            })
+                            }
                         },
-                        crate::field::FieldData::Multiple { first, bytes, last } => {
-                            let last_byte = first_byte + (first != 0) as usize + (last != 0) as usize + bytes as usize;
-                            let params = &params[first_byte..last_byte];
-                            Some(quote! {
+                        |per_mod, field_fun, params| {
+                            quote! {
                                 if #(#params.is_some())||* {
-                                    self.0.lock().unwrap().#per_mod.#field_fun(#(#dim,)* #(#params,)*)?;
+                                    self
+                                        .0
+                                        .lock()
+                                        .unwrap()
+                                        .#per_mod
+                                        .#field_fun(#dim_use #(#params,)*)?;
                                 }
-                            })
+                            }
                         },
-                    }
+                    )
                 });
                 tokens.extend(quote! {
-                    pub fn #write(&self, #(#declare_params),*) -> icicle_vm::cpu::mem::MemResult<()> {
+                    pub fn #write(
+                        &self,
+                        #dim_declare #(#declare_params),*
+                    ) -> icicle_vm::cpu::mem::MemResult<()> {
                         #(#fields)*
                         Ok(())
                     }
                 });
+            }
+        }
+    }
+
+    fn gen_field_register<S, M>(
+        &self,
+        peripherals: &Peripherals,
+        params: &[Ident],
+        field_fun: &Ident,
+        field: &FieldAccess,
+        mut caller_single: S,
+        mut caller_multiple: M,
+    ) -> Option<TokenStream>
+    where
+        S: FnMut(&Ident, &Ident, &Ident, Literal) -> TokenStream,
+        M: FnMut(&Ident, &Ident, &[Ident]) -> TokenStream,
+    {
+        let per_mod =
+            &peripherals.peripheral_structs[field.peripheral_index].mod_name;
+        let lsb = field.field.lsb();
+        let first_byte = (lsb / 8) as usize;
+        match field.data {
+            FieldData::Single(_bits) => {
+                let byte_match = &params[first_byte];
+                let lsb = Literal::u32_unsuffixed(lsb);
+                Some(caller_single(byte_match, per_mod, field_fun, lsb))
+            }
+            FieldData::Multiple { first, bytes, last } => {
+                let last_byte = first_byte
+                    + (first != 0) as usize
+                    + (last != 0) as usize
+                    + bytes as usize;
+                let params = &params[first_byte..last_byte];
+                Some(caller_multiple(per_mod, field_fun, params))
             }
         }
     }
