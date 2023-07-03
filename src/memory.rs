@@ -26,27 +26,67 @@ impl MemoryPage {
         }
         Pages(self, peripherals)
     }
+
     fn gen_pseudo_struct(
         &self,
         peripherals: &Peripherals,
         tokens: &mut TokenStream,
     ) {
         let pseudo_struct = &self.pseudo_struct;
-        let read = self.chunks.iter().map(|chunk| {
-            let start = Literal::u64_unsuffixed(chunk.0.start - self.addr);
-            let startp1 =
-                Literal::u64_unsuffixed((chunk.0.start + 1) - self.addr);
-            let endm1 = Literal::u64_unsuffixed((chunk.0.end - 1) - self.addr);
-            let end = Literal::u64_unsuffixed(chunk.0.end - self.addr);
-            quote! {
-                (#start..=#endm1, #startp1..=#end) => todo!(),
+        let (read, write): (TokenStream, TokenStream) = self
+            .chunks
+            .iter()
+            .map(|chunk| self.gen_chunk_read_write(peripherals, chunk))
+            .unzip();
+        let register_functions =
+            peripherals.registers.iter().filter_map(|(addr, reg)| {
+                (*addr & PAGE_MASK == self.addr)
+                    .then(|| reg.functions(peripherals))
+            });
+        tokens.extend(quote! {
+            pub struct #pseudo_struct(pub std::sync::Arc<std::sync::Mutex<crate::Peripherals>>);
+            impl icicle_vm::cpu::mem::IoMemory for #pseudo_struct {
+                fn read(
+                    &mut self,
+                    _addr: u64,
+                    _buf: &mut [u8],
+                ) -> icicle_vm::cpu::mem::MemResult<()> {
+                    let _start = _addr;
+                    let _end = _start + u64::try_from(_buf.len()).unwrap();
+                    match (_start, _end) {
+                        #read
+                        _ => Err(icicle_vm::cpu::mem::MemError::Unmapped),
+                    }
+                }
+                fn write(
+                    &mut self,
+                    _addr: u64,
+                    _buf: &[u8],
+                ) -> icicle_vm::cpu::mem::MemResult<()> {
+                    let _start = _addr;
+                    let _end = _start + u64::try_from(_buf.len()).unwrap();
+                    match (_start, _end) {
+                        #write
+                        _ => Err(icicle_vm::cpu::mem::MemError::Unmapped),
+                    }
+                    Ok(())
+                }
+            }
+            impl #pseudo_struct {
+                #(#register_functions)*
             }
         });
-        let write = self.chunks.iter().map(move |chunk| {
-            let start = chunk.0.start - self.addr;
-            let end = chunk.0.end - self.addr;
-            let range = chunk.0.start..chunk.0.end;
-            let registers = peripherals.registers.iter()
+    }
+
+    fn gen_chunk_read_write(
+        &self,
+        peripherals: &Peripherals,
+        chunk: &MemoryChunk,
+    ) -> (TokenStream, TokenStream) {
+        let start = chunk.0.start;
+        let end = chunk.0.end;
+        let range = chunk.0.start..chunk.0.end;
+        let registers = peripherals.registers.iter()
             .filter(|(addr, _reg)| range.contains(addr))
             .filter_map(|(addr, reg)| {
                 let reg_start = *addr - self.addr;
@@ -68,55 +108,20 @@ impl MemoryPage {
                     }
                 })
             });
-            let startp1 = Literal::u64_unsuffixed(start + 1);
-            let start = Literal::u64_unsuffixed(start);
-            let endm1 = Literal::u64_unsuffixed(end - 1);
-            let end = Literal::u64_unsuffixed(end);
+        let startp1 = Literal::u64_unsuffixed(start + 1);
+        let start = Literal::u64_unsuffixed(start);
+        let endm1 = Literal::u64_unsuffixed(end - 1);
+        let end = Literal::u64_unsuffixed(end);
+        (
+            quote! {
+                (#start..=#endm1, #startp1..=#end) => todo!(),
+            },
             quote! {
                 (#start..=#endm1, #startp1..=#end) => {
                     #(#registers)*
                 },
-            }
-        });
-        let register_functions =
-            peripherals.registers.iter().filter_map(|(addr, reg)| {
-                (*addr & PAGE_MASK == self.addr)
-                    .then(|| reg.functions(peripherals))
-            });
-        let addr_mask = Literal::u64_unsuffixed(ADDR_MASK);
-        tokens.extend(quote! {
-            pub struct #pseudo_struct(pub std::sync::Arc<std::sync::Mutex<crate::Peripherals>>);
-            impl icicle_vm::cpu::mem::IoMemory for #pseudo_struct {
-                fn read(
-                    &mut self,
-                    _addr: u64,
-                    _buf: &mut [u8],
-                ) -> icicle_vm::cpu::mem::MemResult<()> {
-                    let _start = _addr & #addr_mask;
-                    let _end = _start + u64::try_from(_buf.len()).unwrap();
-                    match (_start, _end) {
-                        #(#read)*
-                        _ => Err(icicle_vm::cpu::mem::MemError::Unmapped),
-                    }
-                }
-                fn write(
-                    &mut self,
-                    _addr: u64,
-                    _buf: &[u8],
-                ) -> icicle_vm::cpu::mem::MemResult<()> {
-                    let _start = _addr & #addr_mask;
-                    let _end = _start + u64::try_from(_buf.len()).unwrap();
-                    match (_start, _end) {
-                        #(#write)*
-                        _ => Err(icicle_vm::cpu::mem::MemError::Unmapped),
-                    }
-                    Ok(())
-                }
-            }
-            impl #pseudo_struct {
-                #(#register_functions)*
-            }
-        });
+            },
+        )
     }
 }
 
