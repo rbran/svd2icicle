@@ -12,13 +12,13 @@ pub struct RegisterFunctions<'a> {
     pub read_fun: Option<Ident>,
     pub write_fun: Option<Ident>,
     pub dim: u32,
-    pub bits: u32,
+    pub bytes: u32,
     pub regs: Vec<&'a Register>,
     pub fields: Vec<FieldAccess<'a>>,
 }
 
 impl<'a> RegisterFunctions<'a> {
-    pub fn new_empty(size: u32, reg: &'a Register) -> Self {
+    pub fn new_empty(bytes: u32, reg: &'a Register) -> Self {
         let name = snake_case(&dim_to_n(&reg.name));
         let dim = match reg {
             svd_parser::svd::MaybeArray::Single(_reg) => 0,
@@ -39,7 +39,7 @@ impl<'a> RegisterFunctions<'a> {
         Self {
             name,
             dim,
-            bits: size,
+            bytes,
             read_fun,
             write_fun,
             regs: vec![],
@@ -47,10 +47,10 @@ impl<'a> RegisterFunctions<'a> {
         }
     }
 
-    pub fn add(&mut self, size: u32, per_i: usize, reg: &'a Register) {
+    pub fn add(&mut self, bytes: u32, per_i: usize, reg: &'a Register) {
         #[cfg(debug_assertions)]
         if let Some(last) = self.regs.last() {
-            if last.name() != reg.name() || self.bits != size {
+            if last.name() != reg.name() || self.bytes != bytes {
                 panic!("diff regs");
             }
         }
@@ -90,8 +90,7 @@ impl<'a> RegisterFunctions<'a> {
     ) {
         let dim_declare = (self.dim != 0).then(|| quote! {_dim: usize,});
         let dim_use = (self.dim != 0).then(|| quote! {_dim,});
-        let bytes = (self.bits + 7) / 8;
-        if bytes == 1 {
+        if self.bytes == 1 {
             if let Some(read) = self.read_fun.as_ref() {
                 let fields = self.fields.iter().filter_map(|field| {
                     let field_fun = field.read.as_ref()?;
@@ -148,7 +147,7 @@ impl<'a> RegisterFunctions<'a> {
                 })
             }
         } else {
-            let params: Box<[_]> = (0..bytes)
+            let params: Box<[_]> = (0..self.bytes)
                 .into_iter()
                 .map(|i| format_ident!("_byte_{}", i))
                 .collect();
@@ -187,7 +186,7 @@ impl<'a> RegisterFunctions<'a> {
                 tokens.extend(quote! {
                     pub fn #read(
                         &self,
-                        #(#declare_params),*
+                        #dim_declare #(#declare_params),*
                     ) -> icicle_vm::cpu::mem::MemResult<()> {
                         #(#fields)*
                         Ok(())
@@ -199,15 +198,15 @@ impl<'a> RegisterFunctions<'a> {
                     quote! { #param: Option<&u8> }
                 });
                 let fields = self.fields.iter().filter_map(|field| {
-                    let mask = Literal::u8_unsuffixed(
-                        u8::MAX >> (u8::BITS - field.field.bit_width()),
-                    );
                     self.gen_field_register(
                         peripherals,
                         &params,
                         field.write.as_ref()?,
                         field,
                         |byte_match, per_mod, field_fun, lsb| {
+                            let mask = Literal::u8_unsuffixed(
+                                u8::MAX >> (u8::BITS - field.field.bit_width()),
+                            );
                             quote! {
                                 if let Some(byte) = #byte_match {
                                     self

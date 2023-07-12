@@ -4,7 +4,7 @@ use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::Peripheral;
 
-use crate::{peripheral::Peripherals, ADDR_MASK, PAGE_MASK};
+use crate::{peripheral::Peripherals, register::RegisterFunctions, PAGE_MASK};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryPage {
@@ -43,31 +43,35 @@ impl MemoryPage {
                 (*addr & PAGE_MASK == self.addr)
                     .then(|| reg.functions(peripherals))
             });
+        let page_offset = Literal::u64_unsuffixed(self.addr);
         tokens.extend(quote! {
-            pub struct #pseudo_struct(pub std::sync::Arc<std::sync::Mutex<crate::Peripherals>>);
+            pub struct #pseudo_struct(
+                pub std::sync::Arc<std::sync::Mutex<crate::Peripherals>>
+            );
             impl icicle_vm::cpu::mem::IoMemory for #pseudo_struct {
                 fn read(
                     &mut self,
                     _addr: u64,
                     _buf: &mut [u8],
                 ) -> icicle_vm::cpu::mem::MemResult<()> {
-                    let _start = _addr;
+                    let _start = _addr - #page_offset;
                     let _end = _start + u64::try_from(_buf.len()).unwrap();
                     match (_start, _end) {
                         #read
-                        _ => Err(icicle_vm::cpu::mem::MemError::Unmapped),
+                        _ => return Err(icicle_vm::cpu::mem::MemError::Unmapped),
                     }
+                    Ok(())
                 }
                 fn write(
                     &mut self,
                     _addr: u64,
                     _buf: &[u8],
                 ) -> icicle_vm::cpu::mem::MemResult<()> {
-                    let _start = _addr;
+                    let _start = _addr - #page_offset;
                     let _end = _start + u64::try_from(_buf.len()).unwrap();
                     match (_start, _end) {
                         #write
-                        _ => Err(icicle_vm::cpu::mem::MemError::Unmapped),
+                        _ => return Err(icicle_vm::cpu::mem::MemError::Unmapped),
                     }
                     Ok(())
                 }
@@ -83,30 +87,26 @@ impl MemoryPage {
         peripherals: &Peripherals,
         chunk: &MemoryChunk,
     ) -> (TokenStream, TokenStream) {
-        let start = chunk.0.start;
-        let end = chunk.0.end;
-        let range = chunk.0.start..chunk.0.end;
-        let registers = peripherals.registers.iter()
-            .filter(|(addr, _reg)| range.contains(addr))
-            .filter_map(|(addr, reg)| {
-                let reg_start = *addr - self.addr;
-                let reg_end = reg_start + (reg.bits / 8) as u64;
-                let bytes = (reg_start..reg_end).into_iter().map(|byte| {
-                    let byte = Literal::u64_unsuffixed(byte as u64);
-                    quote!{if #byte >= _start {_buf.get((#byte - _start) as usize)} else { None }}
-                });
-                let reg_start = Literal::u64_unsuffixed(reg_start);
-                let reg_end = Literal::u64_unsuffixed(reg_end);
-                let reg_fun = if let Some(fun) = reg.write_fun.as_ref() {
-                    quote!{ self.#fun(#(#bytes),*); }
-                } else {
-                    quote!{ return Err(icicle_vm::cpu::mem::MemError::WriteViolation); }
-                };
-                Some(quote! {
-                    if (_start >= #reg_start && _start < #reg_end) || (_end > #reg_start && _end <= #reg_end) {
-                        #reg_fun
-                    }
-                })
+        let page_offset = self.addr;
+        let start = chunk.0.start - page_offset;
+        let end = chunk.0.end - page_offset;
+        let registers_read =
+            peripherals.registers.iter().flat_map(|(addr, reg)| {
+                self.call_register_from_chunk(
+                    chunk,
+                    *addr,
+                    reg,
+                    true,
+                )
+            });
+        let registers_write =
+            peripherals.registers.iter().flat_map(|(addr, reg)| {
+                self.call_register_from_chunk(
+                    chunk,
+                    *addr,
+                    reg,
+                    false,
+                )
             });
         let startp1 = Literal::u64_unsuffixed(start + 1);
         let start = Literal::u64_unsuffixed(start);
@@ -114,14 +114,75 @@ impl MemoryPage {
         let end = Literal::u64_unsuffixed(end);
         (
             quote! {
-                (#start..=#endm1, #startp1..=#end) => todo!(),
+                (#start..=#endm1, #startp1..=#end) => {
+                    #(#registers_read)*
+                },
             },
             quote! {
                 (#start..=#endm1, #startp1..=#end) => {
-                    #(#registers)*
+                    #(#registers_write)*
                 },
             },
         )
+    }
+
+    fn call_register_from_chunk<'b>(
+        &'b self,
+        chunk: &'b MemoryChunk,
+        base_addr: u64,
+        reg: &'b RegisterFunctions,
+        read: bool,
+    ) -> impl Iterator<Item = TokenStream> + 'b {
+        (0..reg.dim).into_iter().filter_map(move |dim_i| {
+            // register is not in this memory page
+            if base_addr < self.addr {
+                return None;
+            }
+            let chunk_offset = base_addr - self.addr;
+            let dim_offset = dim_i as u64 * reg.bytes as u64;
+            let reg_addr_start = base_addr + dim_offset;
+            let reg_start = chunk_offset + dim_offset;
+            let reg_end = reg_start + reg.bytes as u64;
+            chunk.0.contains(&reg_addr_start).then_some((dim_i, reg_start..reg_end))
+        }).map(move |(dim_i, range)| {
+            let bytes = range.clone().into_iter().map(|byte| {
+                let byte = Literal::u64_unsuffixed(byte as u64);
+                if read {
+                    quote! {
+                        (_start <= #byte && _end > #byte)
+                            .then(|| unsafe { std::mem::transmute(
+                                _buf.as_ptr() as usize + (#byte - _start) as usize
+                            )})
+                    }
+                } else {
+                    quote! {
+                        (_start <= #byte && _end > #byte)
+                            .then(|| &_buf[(#byte - _start) as usize])
+                    }
+                }
+            });
+            let reg_start = Literal::u64_unsuffixed(range.start);
+            let reg_end = Literal::u64_unsuffixed(range.end);
+            let fun = if read { &reg.read_fun } else { &reg.write_fun };
+            let reg_fun = if let Some(fun) = fun {
+                if reg.dim > 1 {
+                    let dim_i = Literal::u32_unsuffixed(dim_i);
+                    quote! { self.#fun(#dim_i, #(#bytes),*)?; }
+                } else {
+                    quote! { self.#fun(#(#bytes),*)?; }
+                }
+            } else {
+                quote! {
+                    return Err(icicle_vm::cpu::mem::MemError::WriteViolation);
+                }
+            };
+            quote! {
+                if (_start >= #reg_start && _start < #reg_end)
+                    || (_end > #reg_start && _end <= #reg_end) {
+                    #reg_fun
+                }
+            }
+        })
     }
 }
 

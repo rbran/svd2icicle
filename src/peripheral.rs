@@ -29,15 +29,17 @@ impl<'a> Peripherals<'a> {
         for (per_i, per) in svd.peripherals.iter().enumerate() {
             for reg in per.registers() {
                 let addr = per.base_address + reg.address_offset as u64;
-                let size = reg
+                let bits = reg
                     .properties
                     .size
                     .or(per.default_register_properties.size)
                     .unwrap();
+                assert!(bits % 8 == 0);
+                let bytes = bits / 8;
                 let entry = registers.entry(addr).or_insert_with(|| {
-                    RegisterFunctions::new_empty(size, reg)
+                    RegisterFunctions::new_empty(bytes, reg)
                 });
-                entry.add(size, per_i, reg);
+                entry.add(bytes, per_i, reg);
             }
         }
         let memory = memory::pages_from_chunks(ADDR_BITS, &svd.peripherals);
