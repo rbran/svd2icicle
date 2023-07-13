@@ -5,6 +5,7 @@ use quote::format_ident;
 use quote::quote;
 use svd_parser::svd::{Device, Peripheral};
 
+use crate::helper::{gen_function_write_from_buffer, gen_function_read_from_buffer};
 use crate::register::RegisterFunctions;
 use crate::{formater::*, memory::MemoryPage, ADDR_BITS};
 use crate::{memory, PAGE_LEN};
@@ -83,6 +84,8 @@ impl<'a> Peripherals<'a> {
         self.peripheral_structs
             .iter()
             .for_each(|per| per.gen_mod(self, tokens));
+        gen_function_write_from_buffer(tokens);
+        gen_function_read_from_buffer(tokens);
         let pages = self.memory
             .iter()
             .map(|mem| mem.gen_pages(self));

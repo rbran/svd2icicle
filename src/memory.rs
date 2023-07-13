@@ -92,24 +92,14 @@ impl MemoryPage {
         let end = chunk.0.end - page_offset;
         let registers_read =
             peripherals.registers.iter().flat_map(|(addr, reg)| {
-                self.call_register_from_chunk(
-                    chunk,
-                    *addr,
-                    reg,
-                    true,
-                )
+                self.call_register_from_chunk(chunk, *addr, reg, true)
             });
         let registers_write =
             peripherals.registers.iter().flat_map(|(addr, reg)| {
-                self.call_register_from_chunk(
-                    chunk,
-                    *addr,
-                    reg,
-                    false,
-                )
+                self.call_register_from_chunk(chunk, *addr, reg, false)
             });
         let startp1 = Literal::u64_unsuffixed(start + 1);
-        let start = Literal::u64_unsuffixed(start);
+        let start = (start != 0).then_some(Literal::u64_unsuffixed(start));
         let endm1 = Literal::u64_unsuffixed(end - 1);
         let end = Literal::u64_unsuffixed(end);
         (
@@ -148,20 +138,13 @@ impl MemoryPage {
             let bytes = range.clone().into_iter().map(|byte| {
                 let byte = Literal::u64_unsuffixed(byte as u64);
                 if read {
-                    quote! {
-                        (_start <= #byte && _end > #byte)
-                            .then(|| unsafe { std::mem::transmute(
-                                _buf.as_ptr() as usize + (#byte - _start) as usize
-                            )})
-                    }
+                    quote! { crate::buffer_mut(_start, _end, #byte, _buf) }
                 } else {
-                    quote! {
-                        (_start <= #byte && _end > #byte)
-                            .then(|| &_buf[(#byte - _start) as usize])
-                    }
+                    quote! { crate::buffer_const(_start, _end, #byte, _buf) }
                 }
             });
-            let reg_start = Literal::u64_unsuffixed(range.start);
+            let reg_start = (range.start > 0).then_some(Literal::u64_unsuffixed(range.start)).into_iter();
+            let reg_start2 = reg_start.clone();
             let reg_end = Literal::u64_unsuffixed(range.end);
             let fun = if read { &reg.read_fun } else { &reg.write_fun };
             let reg_fun = if let Some(fun) = fun {
@@ -177,8 +160,8 @@ impl MemoryPage {
                 }
             };
             quote! {
-                if (_start >= #reg_start && _start < #reg_end)
-                    || (_end > #reg_start && _end <= #reg_end) {
+                if (#(_start >= #reg_start &&)* _start < #reg_end)
+                    || (#(_end > #reg_start2 &&)* _end <= #reg_end) {
                     #reg_fun
                 }
             }

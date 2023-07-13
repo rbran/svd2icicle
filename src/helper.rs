@@ -8,7 +8,7 @@ pub fn read_write_field(
     bytes: u32,
     tokens: &mut TokenStream,
 ) {
-    let dim = (dim != 0).then(|| quote! {_dim: usize});
+    let dim = (dim > 1).then(|| quote! {_dim: usize});
     if bytes == 1 {
         if let Some(read) = read {
             tokens.extend(quote! { pub fn #read(&self, #dim) -> icicle_vm::cpu::mem::MemResult<u8> {
@@ -76,4 +76,37 @@ pub fn read_write_generic_body<'a>(params: &'a [Ident]) -> impl ToTokens + 'a {
         }
     }
     Idents(params)
+}
+
+pub fn gen_function_write_from_buffer(tokens: &mut TokenStream) {
+    tokens.extend(quote!{
+        pub fn buffer_mut(
+            _start: u64,
+            _end: u64,
+            _byte: u64,
+            _buf: &[u8],
+        ) -> Option<&mut u8> {
+            if _start > _byte || _end <= _byte {
+                return None;
+            }
+            let addr = _buf.as_ptr() as usize + (_byte - _start) as usize;
+            Some(unsafe { std::mem::transmute(addr) })
+        }
+    });
+}
+
+pub fn gen_function_read_from_buffer(tokens: &mut TokenStream) {
+    tokens.extend(quote!{
+        pub fn buffer_const(
+            _start: u64,
+            _end: u64,
+            _byte: u64,
+            _buf: &[u8],
+        ) -> Option<&u8> {
+            if _start > _byte || _end <= _byte {
+                return None;
+            }
+            Some(&_buf[(_byte - _start) as usize])
+        }
+    });
 }

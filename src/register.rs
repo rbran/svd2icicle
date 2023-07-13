@@ -21,7 +21,7 @@ impl<'a> RegisterFunctions<'a> {
     pub fn new_empty(bytes: u32, reg: &'a Register) -> Self {
         let name = snake_case(&dim_to_n(&reg.name));
         let dim = match reg {
-            svd_parser::svd::MaybeArray::Single(_reg) => 0,
+            svd_parser::svd::MaybeArray::Single(_reg) => 1,
             svd_parser::svd::MaybeArray::Array(_reg, dim) => dim.dim,
         };
         let read_fun = reg
@@ -88,8 +88,8 @@ impl<'a> RegisterFunctions<'a> {
         peripherals: &Peripherals,
         tokens: &mut proc_macro2::TokenStream,
     ) {
-        let dim_declare = (self.dim != 0).then(|| quote! {_dim: usize,});
-        let dim_use = (self.dim != 0).then(|| quote! {_dim,});
+        let dim_declare = (self.dim > 1).then(|| quote! {_dim: usize,});
+        let dim_use = (self.dim > 1).then(|| quote! {_dim,});
         if self.bytes == 1 {
             if let Some(read) = self.read_fun.as_ref() {
                 let fields = self.fields.iter().filter_map(|field| {
@@ -127,7 +127,7 @@ impl<'a> RegisterFunctions<'a> {
                     let lsb = field.field.lsb();
                     let mask = u8::MAX >> (u8::BITS - field.field.bit_width());
                     let dim =
-                        (self.dim != 0).then(|| quote! {_dim}).into_iter();
+                        (self.dim > 1).then(|| quote! {_dim}).into_iter();
                     Some(quote! {
                         self.0.lock().unwrap().#per_mod.#field_fun(
                             #(#dim,)*
