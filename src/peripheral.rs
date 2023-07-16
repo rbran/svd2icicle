@@ -5,7 +5,9 @@ use quote::format_ident;
 use quote::quote;
 use svd_parser::svd::{Device, Peripheral};
 
-use crate::helper::{gen_function_write_from_buffer, gen_function_read_from_buffer};
+use crate::helper::{
+    gen_function_read_from_buffer, gen_function_write_from_buffer,
+};
 use crate::register::RegisterFunctions;
 use crate::{formater::*, memory::MemoryPage, ADDR_BITS};
 use crate::{memory, PAGE_LEN};
@@ -35,14 +37,21 @@ impl<'a> Peripherals<'a> {
                     .size
                     .or(per.default_register_properties.size)
                     .unwrap();
+                #[cfg(debug_assertions)]
                 assert!(bits % 8 == 0);
                 let bytes = bits / 8;
                 let entry = registers.entry(addr).or_insert_with(|| {
                     RegisterFunctions::new_empty(bytes, reg)
                 });
-                entry.add(bytes, per_i, reg);
+                entry.add(bytes, per_i, reg, &per.name);
             }
         }
+        #[cfg(debug_assertions)]
+        assert!(registers
+            .values_mut()
+            .map(|reg| reg.check())
+            .reduce(|x, y| x && y)
+            .unwrap_or(true));
         let memory = memory::pages_from_chunks(ADDR_BITS, &svd.peripherals);
         Self {
             memory,
@@ -86,10 +95,8 @@ impl<'a> Peripherals<'a> {
             .for_each(|per| per.gen_mod(self, tokens));
         gen_function_write_from_buffer(tokens);
         gen_function_read_from_buffer(tokens);
-        let pages = self.memory
-            .iter()
-            .map(|mem| mem.gen_pages(self));
-        tokens.extend(quote!{pub mod pages {
+        let pages = self.memory.iter().map(|mem| mem.gen_pages(self));
+        tokens.extend(quote! {pub mod pages {
             #(#pages)*
         }});
         self.gen_map_pages(tokens);
@@ -127,9 +134,7 @@ impl<'a> PeripheralStruct<'a> {
                 .registers
                 .get(&addr)
                 .unwrap()
-                .fields
-                .iter()
-                .filter(|field| field.peripheral_index == self.index)
+                .gen_fields_functions(self.index)
         });
         token.extend(quote! {
             mod #mod_name {

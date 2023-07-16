@@ -146,23 +146,16 @@ impl MemoryPage {
             let reg_start = (range.start > 0).then_some(Literal::u64_unsuffixed(range.start)).into_iter();
             let reg_start2 = reg_start.clone();
             let reg_end = Literal::u64_unsuffixed(range.end);
-            let fun = if read { &reg.read_fun } else { &reg.write_fun };
-            let reg_fun = if let Some(fun) = fun {
-                if reg.dim > 1 {
-                    let dim_i = Literal::u32_unsuffixed(dim_i);
-                    quote! { self.#fun(#dim_i, #(#bytes),*)?; }
-                } else {
-                    quote! { self.#fun(#(#bytes),*)?; }
-                }
-            } else {
+            let dim = (reg.dim > 1).then(|| Literal::u32_unsuffixed(dim_i));
+            let call = reg.gen_function_call(read, dim, bytes).unwrap_or_else(||
                 quote! {
                     return Err(icicle_vm::cpu::mem::MemError::WriteViolation);
                 }
-            };
+            );
             quote! {
                 if (#(_start >= #reg_start &&)* _start < #reg_end)
                     || (#(_end > #reg_start2 &&)* _end <= #reg_end) {
-                    #reg_fun
+                    #call
                 }
             }
         })
