@@ -305,7 +305,7 @@ impl<'a> RegisterAccess<'a> {
         match field.data {
             FieldData::Single(_bits) => {
                 let byte_match = &params[first_byte];
-                let lsb = Literal::u32_unsuffixed(lsb);
+                let lsb = Literal::u32_unsuffixed(lsb % 8);
                 Some(caller_single(byte_match, field_fun, lsb))
             }
             FieldData::Multiple { first, bytes, last } => {
