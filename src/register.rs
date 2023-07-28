@@ -133,7 +133,7 @@ impl<'a> RegisterAccess<'a> {
         })
     }
 
-    pub fn mem_map_functions<'b>(&'b self) -> impl ToTokens + 'b {
+    pub fn mem_map_functions(&self) -> impl ToTokens + '_ {
         struct Tokens<'a, 'b: 'a>(&'b RegisterAccess<'a>);
         impl ToTokens for Tokens<'_, '_> {
             fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
@@ -193,7 +193,6 @@ impl<'a> RegisterAccess<'a> {
             }
         } else {
             let params: Box<[_]> = (0..self.bytes)
-                .into_iter()
                 .map(|i| format_ident!("_byte_{}", i))
                 .collect();
             if let Some(read) = self.read_fun.as_ref() {
@@ -352,7 +351,7 @@ impl<'a> RegisterAccess<'a> {
         }
     }
 
-    pub fn fields_functions<'b>(&'b self) -> impl ToTokens + 'b {
+    pub fn fields_functions(&self) -> impl ToTokens + '_ {
         struct Token<'b>(&'b RegisterAccess<'b>);
         impl ToTokens for Token<'_> {
             fn to_tokens(&self, tokens: &mut TokenStream) {

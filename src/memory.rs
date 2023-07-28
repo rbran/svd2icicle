@@ -123,7 +123,7 @@ impl MemoryPage {
         reg: &'b RegisterAccess,
         read: bool,
     ) -> impl Iterator<Item = TokenStream> + 'b {
-        (0..reg.dim).into_iter().filter_map(move |dim_i| {
+        (0..reg.dim).filter_map(move |dim_i| {
             // register is not in this memory page
             if base_addr < self.addr {
                 return None;
@@ -135,8 +135,8 @@ impl MemoryPage {
             let reg_end = reg_start + reg.bytes as u64;
             chunk.0.contains(&reg_addr_start).then_some((dim_i, reg_start..reg_end))
         }).map(move |(dim_i, range)| {
-            let bytes = range.clone().into_iter().map(|byte| {
-                let byte = Literal::u64_unsuffixed(byte as u64);
+            let bytes = range.clone().map(|byte| {
+                let byte = Literal::u64_unsuffixed(byte);
                 if read {
                     quote! { crate::buffer_mut(_start, _end, #byte, _buf) }
                 } else {
@@ -167,7 +167,7 @@ pub struct MemoryChunk(pub Range<u64>);
 
 /// create a page-mapped list of peripherals
 /// TODO check that each page is aligned
-pub fn pages_from_chunks<'a>(
+pub fn pages_from_chunks(
     addr_bits: u32,
     peripherals: &[Peripheral],
 ) -> Vec<MemoryPage> {

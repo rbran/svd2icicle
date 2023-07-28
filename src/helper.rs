@@ -23,10 +23,8 @@ pub fn read_write_field(
             }})
         }
     } else {
-        let params: Box<[_]> = (0..bytes)
-            .into_iter()
-            .map(|i| format_ident!("_byte_{}", i))
-            .collect();
+        let params: Box<[_]> =
+            (0..bytes).map(|i| format_ident!("_byte_{}", i)).collect();
         if let Some(read) = read.as_ref() {
             let body = read_write_generic_body(&params);
             let declare_params =
@@ -54,7 +52,7 @@ pub fn read_write_field(
     }
 }
 
-pub fn read_write_generic_body<'a>(params: &'a [Ident]) -> impl ToTokens + 'a {
+pub fn read_write_generic_body(params: &[Ident]) -> impl ToTokens + '_ {
     struct Idents<'a>(&'a [Ident]);
     impl ToTokens for Idents<'_> {
         fn to_tokens(&self, tokens: &mut TokenStream) {
