@@ -79,7 +79,7 @@ pub fn read_write_generic_body<'a>(params: &'a [Ident]) -> impl ToTokens + 'a {
 }
 
 pub fn gen_function_write_from_buffer(tokens: &mut TokenStream) {
-    tokens.extend(quote!{
+    tokens.extend(quote! {
         pub fn buffer_mut(
             _start: u64,
             _end: u64,
@@ -96,7 +96,7 @@ pub fn gen_function_write_from_buffer(tokens: &mut TokenStream) {
 }
 
 pub fn gen_function_read_from_buffer(tokens: &mut TokenStream) {
-    tokens.extend(quote!{
+    tokens.extend(quote! {
         pub fn buffer_const(
             _start: u64,
             _end: u64,

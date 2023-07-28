@@ -1,6 +1,7 @@
+use anyhow::{bail, Result};
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, ToTokens};
-use svd_parser::svd::{Access, Field};
+use svd_parser::svd::{Access, Field, Name, Peripheral, Register};
 
 use crate::{formater::*, helper};
 
@@ -18,45 +19,68 @@ pub struct FieldAccess<'a> {
     pub read: Option<Ident>,
     pub write: Option<Ident>,
     pub data: FieldData,
-    pub field: &'a Field,
-    pub peripheral_index: usize,
+    pub fields: Vec<(&'a Peripheral, &'a Register, &'a Field)>,
 }
 
 impl<'a> FieldAccess<'a> {
     pub fn new(
-        field: &'a Field,
-        peripheral_index: usize,
+        fields: Vec<(&'a Peripheral, &'a Register, &'a Field)>,
         dim: u32,
+        per_name: &str,
         reg_name: &str,
-        access: Access,
-    ) -> Self {
-        let first = match field.bit_offset() % 8 {
-            // don't need a first non-complete byte
-            0 => 0,
-            x => (8 - x).min(field.bit_width()),
+        default_access: Access,
+    ) -> Result<Self> {
+        // all fields names, used for error messages
+        let field_names = || {
+            fields
+                .iter()
+                .map(|(per, reg, field)| -> String {
+                    format!("{}::{}::{}", per.name(), reg.name(), field.name())
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
         };
-        let last = (field.bit_width() - first) % 8;
-        let bytes = (field.bit_width() - (last + first)) / 8;
-        let data = match (first, bytes, last) {
+        //TODO how to get the name?
+        let name = snake_case(&fields[0].2.name);
+        // all fields have the same offset and len
+        // TODO check that all fields have the same len, the offset was checked
+        // by register call
+        let width = fields[0].2.bit_width();
+        let first_byte_len = fields[0].2.bit_offset();
+        let first_byte_len = match first_byte_len % 8 {
+            0 => 0, // don't need align
+            x => (8 - x).min(width),
+        };
+        let last_byte_len = (width - first_byte_len) % 8;
+        let bytes = (width - (last_byte_len + first_byte_len)) / 8;
+        let data = match (first_byte_len, bytes, last_byte_len) {
             (0, 1, 0) => FieldData::Single(8),
             (x, 0, 0) | (0, 0, x) => FieldData::Single(x),
             (first, bytes, last) => FieldData::Multiple { first, bytes, last },
         };
-        let field_name = snake_case(&field.name);
+
+        // all fields need to have the same access permissions
+        let mut access_iter = fields
+            .iter()
+            .map(|(_per, _reg, field)| field.access.unwrap_or(default_access));
+        let access = access_iter.next().unwrap();
+        if access_iter.any(|other_access| other_access != access) {
+            bail!("fields {} with diferent permissions", field_names(),)
+        }
+
         let read = access
             .can_read()
-            .then(|| format_ident!("read_{}_{}", reg_name, &field_name));
-        let write = access
-            .can_write()
-            .then(|| format_ident!("write_{}_{}", reg_name, &field_name));
-        Self {
+            .then(|| format_ident!("read_{}_{}_{}", per_name, reg_name, &name));
+        let write = access.can_write().then(|| {
+            format_ident!("write_{}_{}_{}", per_name, reg_name, &name)
+        });
+        Ok(Self {
             dim,
             read,
             write,
             data,
-            field,
-            peripheral_index,
-        }
+            fields,
+        })
     }
 }
 impl ToTokens for FieldAccess<'_> {

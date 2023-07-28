@@ -4,9 +4,9 @@ mod helper;
 use peripheral::Peripherals;
 
 mod field;
-mod register;
 mod memory;
 mod peripheral;
+mod register;
 
 use std::path::Path;
 
@@ -30,7 +30,7 @@ pub fn gen_empty_implementation(
 fn inner_gen_empty_implementation(svd: &Path, lib_rs: &Path) -> Result<()> {
     let svd_data = std::fs::read_to_string(svd)?;
     let svd = svd_parser::parse(&svd_data)?;
-    let peripherals = Peripherals::new(&svd);
+    let peripherals = Peripherals::new(&svd)?;
     let mut output = TokenStream::new();
     peripherals.gen_all(&mut output);
     std::fs::write(lib_rs, output.to_string().as_bytes())?;

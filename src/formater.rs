@@ -3,7 +3,7 @@ pub fn snake_case(name: &str) -> String {
     name.to_lowercase()
 }
 
-pub fn camel_case(name: &str) -> String{
+pub fn camel_case(name: &str) -> String {
     //TODO remove '_' and similar
     format!(
         "{}{}",

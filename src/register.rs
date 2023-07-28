@@ -1,141 +1,158 @@
+use anyhow::{anyhow, bail, Result};
+use indexmap::IndexMap;
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
-use svd_parser::svd::{Name, Register};
+use svd_parser::svd::{Name, Peripheral, Register};
 
 use crate::field::{FieldAccess, FieldData};
-use crate::formater::{dim_to_n, snake_case};
+use crate::formater::{self, dim_to_n, snake_case};
 use crate::helper;
-use crate::peripheral::Peripherals;
 
 #[derive(Debug)]
-pub struct RegisterFunctions<'a> {
-    pub name: String,
+pub struct RegisterAccess<'a> {
     pub read_fun: Option<Ident>,
     pub write_fun: Option<Ident>,
     pub dim: u32,
     pub bytes: u32,
-    pub regs: Vec<(usize, &'a Register)>,
+    pub regs: Vec<&'a Register>,
     pub fields: Vec<FieldAccess<'a>>,
 }
 
-impl<'a> RegisterFunctions<'a> {
-    pub fn new_empty(bytes: u32, reg: &'a Register) -> Self {
-        let name = snake_case(&dim_to_n(&reg.name));
-        let dim = match reg {
-            svd_parser::svd::MaybeArray::Single(_reg) => 1,
-            svd_parser::svd::MaybeArray::Array(_reg, dim) => dim.dim,
+impl<'a> RegisterAccess<'a> {
+    pub fn new(regs: Vec<(&'a Peripheral, &'a Register)>) -> Result<Self> {
+        // all register names, used for error messages
+        let regs_names = || {
+            regs.iter()
+                .map(|(per, reg)| format!("{}::{}", per.name(), reg.name()))
+                .collect::<Vec<_>>()
+                .join(", ")
         };
-        let read_fun = reg
-            .properties
-            .access
-            .unwrap_or_default()
+
+        // combine the names of all peripherals
+        let per_name: String = {
+            let mut pers = std::collections::HashSet::new();
+            regs.iter()
+                .filter_map(move |(per, _reg)| {
+                    pers.insert(
+                        (*per as *const svd_parser::svd::MaybeArray<_>)
+                            as usize,
+                    )
+                    .then_some(formater::snake_case(per.name.as_str()))
+                })
+                .collect()
+        };
+        //TODO how to handle regs with multiple names?
+        let name = snake_case(&dim_to_n(&regs[0].1.name));
+
+        // registers can have diferent dims, use the biggest one
+        let dim = regs
+            .iter()
+            .map(|(_per, reg)| match reg {
+                svd_parser::svd::MaybeArray::Single(_reg) => 1,
+                svd_parser::svd::MaybeArray::Array(_reg, dim) => dim.dim,
+            })
+            .max()
+            .unwrap();
+
+        // all register need to have the same access permissions
+        let mut access_iter = regs.iter().map(|(per, reg)| {
+            reg.properties
+                .access
+                .or(per.default_register_properties.access)
+        });
+        let access = access_iter.next().unwrap().ok_or_else(|| {
+            anyhow!(
+                "registers {}::{} without permissions",
+                regs[0].0.name(),
+                regs[0].1.name(),
+            )
+        })?;
+        if access_iter.any(|other_access| other_access != Some(access)) {
+            bail!(
+                "overlapping registers {} with diferent permissions",
+                regs_names(),
+            )
+        }
+        let read_fun = access
             .can_read()
-            .then(|| format_ident!("read_{}", &name));
-        let write_fun = reg
-            .properties
-            .access
-            .unwrap_or_default()
-            .can_read()
-            .then(|| format_ident!("write_{}", &name));
-        Self {
-            name,
+            .then(|| format_ident!("read_{}_{}", &per_name, name));
+        let write_fun = access
+            .can_write()
+            .then(|| format_ident!("write_{}_{}", &per_name, name));
+
+        let mut regs_sizes = regs.iter().map(|(per, reg)| {
+            reg.properties.size.or(per.default_register_properties.size)
+        });
+        let bits = regs_sizes.next().unwrap().ok_or_else(|| {
+            anyhow!(
+                "registers {}::{} without size",
+                regs[0].0.name(),
+                regs[0].1.name(),
+            )
+        })?;
+        if regs_sizes.any(|o_bits| o_bits != Some(bits)) {
+            bail!("overlapping register {} with diferent sizes", regs_names())
+        }
+        if bits % 8 != 0 {
+            bail!(
+                "overlapping register {} with invalid size {}bits",
+                regs_names(),
+                bits,
+            )
+        }
+        let bytes = bits / 8;
+
+        let mut fields: IndexMap<u32, Vec<_>> = IndexMap::new();
+        for (per, reg, field) in regs.iter().flat_map(|(per, reg)| {
+            reg.fields().map(move |field| (*per, *reg, field))
+        }) {
+            fields
+                .entry(field.bit_offset())
+                .and_modify(|regs| regs.push((per, reg, field)))
+                .or_insert_with(|| vec![(per, reg, field)]);
+        }
+
+        // TODO check if the fields overlap or goes outside the register
+        let fields = fields
+            .into_iter()
+            .map(|(_offset, fields)| {
+                // TODO compare field access with register access
+                FieldAccess::new(fields, dim, &per_name, &name, access)
+            })
+            .collect::<Result<_, _>>()?;
+
+        let regs = regs.into_iter().map(|(_per, reg)| reg).collect();
+
+        Ok(Self {
             dim,
             bytes,
             read_fun,
             write_fun,
-            regs: vec![],
-            fields: vec![],
-        }
+            regs,
+            fields,
+        })
     }
 
-    pub fn add(
-        &mut self,
-        bytes: u32,
-        per_i: usize,
-        reg: &'a Register,
-        per_name: &str,
-    ) {
-        if let Some(last) = self.regs.last() {
-            // the same register can have multiple names, but not different size
-            if self.bytes != bytes {
-                panic!(
-                    "{} diff regs len {}: {} != {}",
-                    per_name,
-                    self.bytes,
-                    bytes,
-                    last.1.name()
-                );
-            }
-        }
-
-        self.regs.push((per_i, reg));
-        for field in reg.fields() {
-            let field = FieldAccess::new(
-                field,
-                per_i,
-                self.dim,
-                &self.name,
-                field.access.unwrap_or_default(),
-            );
-            self.fields.push(field);
-        }
-    }
-
-    // HACK register with no fields are fields on thenselves
-    #[cfg(debug_assertions)]
-    pub fn is_valid(&self) -> bool {
-        // TODO check if the fields overlap or goes outside the register
-
-        // register that have no fields can be threated as having a single
-        // field, but they can belong to multiple peripherals. If a register
-        // have fields, each field should belong to a single peripheral.
-        true
-    }
-
-    pub fn is_multiple_per(&self) -> bool {
-        let first_per = self.regs.first().unwrap().0;
-        self.fields.is_empty()
-            && self.regs[1..].iter().any(|reg| reg.0 != first_per)
-    }
-
-    pub fn mem_map_functions<'b>(
-        &'b self,
-        peripherals: &'b Peripherals,
-    ) -> impl ToTokens + 'b {
-        struct Tokens<'a, 'b: 'a>(
-            &'b RegisterFunctions<'a>,
-            &'b Peripherals<'a>,
-        );
+    pub fn mem_map_functions<'b>(&'b self) -> impl ToTokens + 'b {
+        struct Tokens<'a, 'b: 'a>(&'b RegisterAccess<'a>);
         impl ToTokens for Tokens<'_, '_> {
             fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
-                self.0.gen_mem_map_functions(self.1, tokens)
+                self.0.gen_mem_map_functions(tokens)
             }
         }
-        Tokens(self, peripherals)
+        Tokens(self)
     }
 
-    fn gen_mem_map_functions(
-        &self,
-        peripherals: &Peripherals,
-        tokens: &mut proc_macro2::TokenStream,
-    ) {
+    fn gen_mem_map_functions(&self, tokens: &mut proc_macro2::TokenStream) {
         let dim_declare = (self.dim > 1).then(|| quote! {_dim: usize,});
         let dim_use = (self.dim > 1).then(|| quote! {_dim,});
         if self.bytes == 1 {
             if let Some(read) = self.read_fun.as_ref() {
                 let fields = self.fields.iter().filter_map(|field| {
                     let field_fun = field.read.as_ref()?;
-                    let per_mod = &peripherals.peripheral_structs
-                        [field.peripheral_index]
-                        .mod_name;
-                    let lsb = field.field.lsb();
+                    let lsb = field.fields[0].2.lsb();
                     Some(quote! {
-                        self
-                            .0
-                            .lock()
-                            .unwrap()
-                            .#per_mod
-                            .#field_fun(#dim_use)? << #lsb;
+                        self.0.lock().unwrap().#field_fun(#dim_use)? << #lsb;
                     })
                 });
                 tokens.extend(quote! {
@@ -152,14 +169,12 @@ impl<'a> RegisterFunctions<'a> {
             if let Some(write) = self.write_fun.as_ref() {
                 let fields = self.fields.iter().filter_map(|field| {
                     let field_fun = field.read.as_ref()?;
-                    let per_mod = &peripherals.peripheral_structs
-                        [field.peripheral_index]
-                        .mod_name;
-                    let lsb = field.field.lsb();
-                    let mask = u8::MAX >> (u8::BITS - field.field.bit_width());
+                    let lsb = field.fields[0].2.lsb();
+                    let mask =
+                        u8::MAX >> (u8::BITS - field.fields[0].2.bit_width());
                     let dim = (self.dim > 1).then(|| quote! {_dim}).into_iter();
                     Some(quote! {
-                        self.0.lock().unwrap().#per_mod.#field_fun(
+                        self.0.lock().unwrap().#field_fun(
                             #(#dim,)*
                             (_value >> #lsb) #mask
                         )?;
@@ -187,27 +202,24 @@ impl<'a> RegisterFunctions<'a> {
                 });
                 let fields = self.fields.iter().filter_map(|field| {
                     self.gen_field_register(
-                        peripherals,
                         &params,
                         field.read.as_ref()?,
                         field,
-                        |byte_match, per_mod, field_fun, lsb| quote! {
+                        |byte_match, field_fun, lsb| quote! {
                             if let Some(byte) = &mut #byte_match {
                                 **byte |= self
                                     .0
                                     .lock()
                                     .unwrap()
-                                    .#per_mod
                                     .#field_fun(#dim_use)? << #lsb;
                             }
                         },
-                        |per_mod, field_fun, params| quote! {
+                        |field_fun, params| quote! {
                             if #(#params.is_some())||* {
                                 self
                                     .0
                                     .lock()
                                     .unwrap()
-                                    .#per_mod
                                     .#field_fun(#dim_use #(&mut #params),*)?;
                             }
                         }
@@ -229,13 +241,14 @@ impl<'a> RegisterFunctions<'a> {
                 });
                 let fields = self.fields.iter().filter_map(|field| {
                     self.gen_field_register(
-                        peripherals,
                         &params,
                         field.write.as_ref()?,
                         field,
-                        |byte_match, per_mod, field_fun, lsb| {
+                        |byte_match, field_fun, lsb| {
                             let mask = Literal::u8_unsuffixed(
-                                u8::MAX >> (u8::BITS - field.field.bit_width()),
+                                u8::MAX
+                                    >> (u8::BITS
+                                        - field.fields[0].2.bit_width()),
                             );
                             quote! {
                                 if let Some(byte) = #byte_match {
@@ -243,21 +256,19 @@ impl<'a> RegisterFunctions<'a> {
                                         .0
                                         .lock()
                                         .unwrap()
-                                        .#per_mod
                                         .#field_fun(
                                             #dim_use (*byte >> #lsb) & #mask
                                         )?;
                                 }
                             }
                         },
-                        |per_mod, field_fun, params| {
+                        |field_fun, params| {
                             quote! {
                                 if #(#params.is_some())||* {
                                     self
                                         .0
                                         .lock()
                                         .unwrap()
-                                        .#per_mod
                                         .#field_fun(#dim_use #(#params,)*)?;
                                 }
                             }
@@ -279,7 +290,6 @@ impl<'a> RegisterFunctions<'a> {
 
     fn gen_field_register<S, M>(
         &self,
-        peripherals: &Peripherals,
         params: &[Ident],
         field_fun: &Ident,
         field: &FieldAccess,
@@ -287,18 +297,16 @@ impl<'a> RegisterFunctions<'a> {
         mut caller_multiple: M,
     ) -> Option<TokenStream>
     where
-        S: FnMut(&Ident, &Ident, &Ident, Literal) -> TokenStream,
-        M: FnMut(&Ident, &Ident, &[Ident]) -> TokenStream,
+        S: FnMut(&Ident, &Ident, Literal) -> TokenStream,
+        M: FnMut(&Ident, &[Ident]) -> TokenStream,
     {
-        let per_mod =
-            &peripherals.peripheral_structs[field.peripheral_index].mod_name;
-        let lsb = field.field.lsb();
+        let lsb = field.fields[0].2.lsb();
         let first_byte = (lsb / 8) as usize;
         match field.data {
             FieldData::Single(_bits) => {
                 let byte_match = &params[first_byte];
                 let lsb = Literal::u32_unsuffixed(lsb);
-                Some(caller_single(byte_match, per_mod, field_fun, lsb))
+                Some(caller_single(byte_match, field_fun, lsb))
             }
             FieldData::Multiple { first, bytes, last } => {
                 let last_byte = first_byte
@@ -306,7 +314,7 @@ impl<'a> RegisterFunctions<'a> {
                     + (last != 0) as usize
                     + bytes as usize;
                 let params = &params[first_byte..last_byte];
-                Some(caller_multiple(per_mod, field_fun, params))
+                Some(caller_multiple(field_fun, params))
             }
         }
     }
@@ -329,28 +337,28 @@ impl<'a> RegisterFunctions<'a> {
         Some(quote! { self.#fun(#(#dim,)* #(#params),*)?; })
     }
 
-    pub fn gen_per_fields_functions<'b>(
-        &'b self,
-        peripheral_index: usize,
-    ) -> impl Iterator<Item = TokenStream> + 'b {
-        self.fields
-            .iter()
-            .filter(move |field| field.peripheral_index == peripheral_index)
-            .map(|x| x.into_token_stream())
+    fn gen_fields_functions(&self, tokens: &mut TokenStream) {
+        // if no fields, means it is a single implicit field
+        if self.fields.is_empty() {
+            helper::read_write_field(
+                self.dim,
+                self.read_fun.as_ref(),
+                self.write_fun.as_ref(),
+                self.bytes,
+                tokens,
+            )
+        } else {
+            self.fields.iter().for_each(|x| x.to_tokens(tokens))
+        }
     }
 
-    pub fn gen_other_fields_functions(&self) -> Option<TokenStream> {
-        if !self.is_multiple_per() {
-            return None;
+    pub fn fields_functions<'b>(&'b self) -> impl ToTokens + 'b {
+        struct Token<'b>(&'b RegisterAccess<'b>);
+        impl ToTokens for Token<'_> {
+            fn to_tokens(&self, tokens: &mut TokenStream) {
+                self.0.gen_fields_functions(tokens)
+            }
         }
-        let mut tokens = TokenStream::new();
-        Some(helper::read_write_field(
-            self.dim,
-            self.read_fun.as_ref(),
-            self.write_fun.as_ref(),
-            self.bytes,
-            &mut tokens,
-        ));
-        Some(tokens)
+        Token(self)
     }
 }

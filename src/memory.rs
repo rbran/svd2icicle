@@ -4,7 +4,7 @@ use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::Peripheral;
 
-use crate::{peripheral::Peripherals, register::RegisterFunctions, PAGE_MASK};
+use crate::{peripheral::Peripherals, register::RegisterAccess, PAGE_MASK};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryPage {
@@ -41,7 +41,7 @@ impl MemoryPage {
         let register_functions =
             peripherals.registers.iter().filter_map(|(addr, reg)| {
                 (*addr & PAGE_MASK == self.addr)
-                    .then(|| reg.mem_map_functions(peripherals))
+                    .then(|| reg.mem_map_functions())
             });
         let page_offset = Literal::u64_unsuffixed(self.addr);
         tokens.extend(quote! {
@@ -120,7 +120,7 @@ impl MemoryPage {
         &'b self,
         chunk: &'b MemoryChunk,
         base_addr: u64,
-        reg: &'b RegisterFunctions,
+        reg: &'b RegisterAccess,
         read: bool,
     ) -> impl Iterator<Item = TokenStream> + 'b {
         (0..reg.dim).into_iter().filter_map(move |dim_i| {
