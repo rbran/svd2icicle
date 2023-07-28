@@ -37,8 +37,7 @@ impl<'a> Peripherals<'a> {
                     .size
                     .or(per.default_register_properties.size)
                     .unwrap();
-                #[cfg(debug_assertions)]
-                assert!(bits % 8 == 0);
+                debug_assert!(bits % 8 == 0);
                 let bytes = bits / 8;
                 let entry = registers.entry(addr).or_insert_with(|| {
                     RegisterFunctions::new_empty(bytes, reg)
@@ -47,11 +46,13 @@ impl<'a> Peripherals<'a> {
             }
         }
         #[cfg(debug_assertions)]
-        assert!(registers
-            .values_mut()
-            .map(|reg| reg.check())
-            .reduce(|x, y| x && y)
-            .unwrap_or(true));
+        for reg in registers.values() {
+            if !reg.is_valid() {
+                let regs: Vec<_> =
+                    reg.regs.iter().map(|(_, reg)| reg.name.as_str()).collect();
+                panic!("invalid regs at {}", regs.join(", "));
+            }
+        }
         let memory = memory::pages_from_chunks(ADDR_BITS, &svd.peripherals);
         Self {
             memory,
@@ -88,11 +89,25 @@ impl<'a> Peripherals<'a> {
             }
         })
     }
+
+    pub fn gen_other_register(&self, tokens: &mut TokenStream) {
+        let registers = self
+            .registers
+            .values()
+            .filter_map(|reg| reg.gen_other_fields_functions());
+        tokens.extend(quote! {
+            mod other_registers {
+                #(#registers)*
+            }
+        })
+    }
+
     pub fn gen_all(&self, tokens: &mut TokenStream) {
         self.gen_struct(tokens);
         self.peripheral_structs
             .iter()
             .for_each(|per| per.gen_mod(self, tokens));
+        self.gen_other_register(tokens);
         gen_function_write_from_buffer(tokens);
         gen_function_read_from_buffer(tokens);
         let pages = self.memory.iter().map(|mem| mem.gen_pages(self));
@@ -134,7 +149,7 @@ impl<'a> PeripheralStruct<'a> {
                 .registers
                 .get(&addr)
                 .unwrap()
-                .gen_fields_functions(self.index)
+                .gen_per_fields_functions(self.index)
         });
         token.extend(quote! {
             mod #mod_name {

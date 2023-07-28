@@ -55,17 +55,8 @@ impl<'a> RegisterFunctions<'a> {
         reg: &'a Register,
         per_name: &str,
     ) {
-        #[cfg(debug_assertions)]
         if let Some(last) = self.regs.last() {
-            // Allowed: NRF51 TWI0 EVENTS_READY and EVENTS_RXDREADY are equal
-            //if last.name() != reg.name() {
-            //    panic!(
-            //        "{} diff regs: {} != {}",
-            //        per_name,
-            //        last.name(),
-            //        reg.name()
-            //    );
-            //}
+            // the same register can have multiple names, but not different size
             if self.bytes != bytes {
                 panic!(
                     "{} diff regs len {}: {} != {}",
@@ -92,26 +83,22 @@ impl<'a> RegisterFunctions<'a> {
 
     // HACK register with no fields are fields on thenselves
     #[cfg(debug_assertions)]
-    pub fn check(&mut self) -> bool {
-        let mut problem = true;
-        //#[cfg(debug_assertions)]
+    pub fn is_valid(&self) -> bool {
         // TODO check if the fields overlap or goes outside the register
 
-        if self.fields.len() == 0 {
-            let first_per = self.regs.first().unwrap().0;
-            if self.regs[1..].iter().any(|(per_i, _)| first_per != *per_i) {
-                let regs: Vec<_> =
-                    self.regs.iter().map(|reg| reg.1.name.as_str()).collect();
-                if !regs.is_empty() {
-                    problem = false;
-                    println!("reg empty {}, multiple per", regs.join(", "));
-                }
-            }
-        }
-        problem
+        // register that have no fields can be threated as having a single
+        // field, but they can belong to multiple peripherals. If a register
+        // have fields, each field should belong to a single peripheral.
+        true
     }
 
-    pub fn functions<'b>(
+    pub fn is_multiple_per(&self) -> bool {
+        let first_per = self.regs.first().unwrap().0;
+        self.fields.is_empty()
+            && self.regs[1..].iter().any(|reg| reg.0 != first_per)
+    }
+
+    pub fn mem_map_functions<'b>(
         &'b self,
         peripherals: &'b Peripherals,
     ) -> impl ToTokens + 'b {
@@ -121,13 +108,13 @@ impl<'a> RegisterFunctions<'a> {
         );
         impl ToTokens for Tokens<'_, '_> {
             fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
-                self.0.gen_functions(self.1, tokens)
+                self.0.gen_mem_map_functions(self.1, tokens)
             }
         }
         Tokens(self, peripherals)
     }
 
-    fn gen_functions(
+    fn gen_mem_map_functions(
         &self,
         peripherals: &Peripherals,
         tokens: &mut proc_macro2::TokenStream,
@@ -324,7 +311,7 @@ impl<'a> RegisterFunctions<'a> {
         }
     }
 
-    pub fn gen_function_call<I>(
+    pub fn gen_mem_page_function_call<I>(
         &self,
         read: bool,
         dim: Option<Literal>,
@@ -336,13 +323,13 @@ impl<'a> RegisterFunctions<'a> {
         let fun = if read {
             self.read_fun.as_ref()?
         } else {
-            &self.write_fun.as_ref()?
+            self.write_fun.as_ref()?
         };
         let dim = dim.into_iter();
         Some(quote! { self.#fun(#(#dim,)* #(#params),*)?; })
     }
 
-    pub fn gen_fields_functions<'b>(
+    pub fn gen_per_fields_functions<'b>(
         &'b self,
         peripheral_index: usize,
     ) -> impl Iterator<Item = TokenStream> + 'b {
@@ -350,21 +337,20 @@ impl<'a> RegisterFunctions<'a> {
             .iter()
             .filter(move |field| field.peripheral_index == peripheral_index)
             .map(|x| x.into_token_stream())
-            .chain(
-                self.fields
-                    .is_empty()
-                    .then(|| {
-                        let mut tokens = TokenStream::new();
-                        helper::read_write_field(
-                            self.dim,
-                            self.read_fun.as_ref(),
-                            self.write_fun.as_ref(),
-                            self.bytes,
-                            &mut tokens,
-                        );
-                        tokens
-                    })
-                    .into_iter(),
-            )
+    }
+
+    pub fn gen_other_fields_functions(&self) -> Option<TokenStream> {
+        if !self.is_multiple_per() {
+            return None;
+        }
+        let mut tokens = TokenStream::new();
+        Some(helper::read_write_field(
+            self.dim,
+            self.read_fun.as_ref(),
+            self.write_fun.as_ref(),
+            self.bytes,
+            &mut tokens,
+        ));
+        Some(tokens)
     }
 }

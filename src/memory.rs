@@ -41,7 +41,7 @@ impl MemoryPage {
         let register_functions =
             peripherals.registers.iter().filter_map(|(addr, reg)| {
                 (*addr & PAGE_MASK == self.addr)
-                    .then(|| reg.functions(peripherals))
+                    .then(|| reg.mem_map_functions(peripherals))
             });
         let page_offset = Literal::u64_unsuffixed(self.addr);
         tokens.extend(quote! {
@@ -147,7 +147,7 @@ impl MemoryPage {
             let reg_start2 = reg_start.clone();
             let reg_end = Literal::u64_unsuffixed(range.end);
             let dim = (reg.dim > 1).then(|| Literal::u32_unsuffixed(dim_i));
-            let call = reg.gen_function_call(read, dim, bytes).unwrap_or_else(||
+            let call = reg.gen_mem_page_function_call(read, dim, bytes).unwrap_or_else(||
                 quote! {
                     return Err(icicle_vm::cpu::mem::MemError::WriteViolation);
                 }
