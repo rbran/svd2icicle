@@ -5,9 +5,6 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use svd_parser::svd::Device;
 
-use crate::helper::{
-    gen_function_read_from_buffer, gen_function_write_from_buffer,
-};
 use crate::register::RegisterAccess;
 use crate::{memory, PAGE_LEN};
 use crate::{memory::MemoryPage, ADDR_BITS};
@@ -43,17 +40,9 @@ impl<'a> Peripherals<'a> {
             registers,
         })
     }
-    fn gen_struct(&self, tokens: &mut TokenStream) {
-        tokens.extend(quote! {
-            #[derive(Default)]
-            pub struct Peripherals {
-                #[doc = "TODO: implement the peripherals data here"]
-                _todo: (),
-            }
-        })
-    }
 
     fn gen_map_pages(&self, tokens: &mut TokenStream) {
+        // memory pages mapping to the cpu
         let memory_cpu_map = self.memory.iter().map(|page| {
             let addr_start = Literal::u64_unsuffixed(page.addr);
             let pseudo_struct = &page.pseudo_struct;
@@ -63,31 +52,58 @@ impl<'a> Peripherals<'a> {
             }
         });
         tokens.extend(quote! {
-            pub fn map_cpu(_pe: &std::sync::Arc<std::sync::Mutex<Peripherals>>, _cpu: &mut icicle_vm::cpu::Cpu) {
+            pub fn map_cpu(_pe: &std::sync::Arc<std::sync::Mutex<peripheral::Peripherals>>, _cpu: &mut icicle_vm::cpu::Cpu) {
                 #(#memory_cpu_map)*
             }
         })
     }
 
     pub fn gen_all(&self, tokens: &mut TokenStream) {
-        // gen the empty struct
-        self.gen_struct(tokens);
-        // then the register functions
+        // the register/fields read/write functions
         let regs_funs =
             self.registers.values().map(|reg| reg.fields_functions());
-        tokens.extend(quote! {
-            impl Peripherals {
-                #(#regs_funs)*
-            }
-        });
-        // helper functions to get buffer split
-        gen_function_write_from_buffer(tokens);
-        gen_function_read_from_buffer(tokens);
         // all the memory blocks
         let pages = self.memory.iter().map(|mem| mem.gen_pages(self));
-        tokens.extend(quote! {pub mod pages {
-            #(#pages)*
-        }});
+        // gen the empty struct, and read/write functions
+        tokens.extend(quote! {
+            pub mod peripheral {
+                #[derive(Default)]
+                pub struct Peripherals {
+                    #[doc = "TODO: implement the peripherals data here"]
+                    _todo: (),
+                }
+                impl Peripherals {
+                    #(#regs_funs)*
+                }
+            }
+            pub mod pages {
+                // helper functions to get buffer split
+                fn buffer_mut(
+                    _start: u64,
+                    _end: u64,
+                    _byte: u64,
+                    _buf: &[u8],
+                ) -> Option<&mut u8> {
+                    if _start > _byte || _end <= _byte {
+                        return None;
+                    }
+                    let addr = _buf.as_ptr() as usize + (_byte - _start) as usize;
+                    Some(unsafe { std::mem::transmute(addr) })
+                }
+                fn buffer_const(
+                    _start: u64,
+                    _end: u64,
+                    _byte: u64,
+                    _buf: &[u8],
+                ) -> Option<&u8> {
+                    if _start > _byte || _end <= _byte {
+                        return None;
+                    }
+                    Some(&_buf[(_byte - _start) as usize])
+                }
+                #(#pages)*
+            }
+        });
         self.gen_map_pages(tokens);
     }
 }

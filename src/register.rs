@@ -197,31 +197,35 @@ impl<'a> RegisterAccess<'a> {
                 .collect();
             if let Some(read) = self.read_fun.as_ref() {
                 let declare_params = params.iter().map(|param| {
-                    quote! { mut #param: Option<&mut u8> }
+                    quote! { #param: &mut Option<&mut u8> }
                 });
                 let fields = self.fields.iter().filter_map(|field| {
                     self.gen_field_register(
                         &params,
                         field.read.as_ref()?,
                         field,
-                        |byte_match, field_fun, lsb| quote! {
-                            if let Some(byte) = &mut #byte_match {
-                                **byte |= self
-                                    .0
-                                    .lock()
-                                    .unwrap()
-                                    .#field_fun(#dim_use)? << #lsb;
+                        |byte_match, field_fun, lsb| {
+                            quote! {
+                                if let Some(byte) = #byte_match {
+                                    **byte |= self
+                                        .0
+                                        .lock()
+                                        .unwrap()
+                                        .#field_fun(#dim_use)? << #lsb;
+                                }
                             }
                         },
-                        |field_fun, params| quote! {
-                            if #(#params.is_some())||* {
-                                self
-                                    .0
-                                    .lock()
-                                    .unwrap()
-                                    .#field_fun(#dim_use #(&mut #params),*)?;
+                        |field_fun, params| {
+                            quote! {
+                                if #(#params.is_some())||* {
+                                    self
+                                        .0
+                                        .lock()
+                                        .unwrap()
+                                        .#field_fun(#dim_use #(#params),*)?;
+                                }
                             }
-                        }
+                        },
                     )
                 });
                 tokens.extend(quote! {
@@ -332,8 +336,16 @@ impl<'a> RegisterAccess<'a> {
         } else {
             self.write_fun.as_ref()?
         };
+        // if implicity field, use the peripheral call directly, otherwise
+        // call the register implementation from the pages struct
         let dim = dim.into_iter();
-        Some(quote! { self.#fun(#(#dim,)* #(#params),*)?; })
+        if self.fields.is_empty() {
+            Some(quote! {
+                self.0.lock().unwrap().#fun(#(#dim,)* #(#params),*)?;
+            })
+        } else {
+            Some(quote! { self.#fun(#(#dim,)* #(#params),*)?; })
+        }
     }
 
     fn gen_fields_functions(&self, tokens: &mut TokenStream) {

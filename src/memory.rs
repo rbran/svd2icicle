@@ -46,7 +46,7 @@ impl MemoryPage {
         let page_offset = Literal::u64_unsuffixed(self.addr);
         tokens.extend(quote! {
             pub struct #pseudo_struct(
-                pub std::sync::Arc<std::sync::Mutex<crate::Peripherals>>
+                pub std::sync::Arc<std::sync::Mutex<super::peripheral::Peripherals>>
             );
             impl icicle_vm::cpu::mem::IoMemory for #pseudo_struct {
                 fn read(
@@ -138,9 +138,9 @@ impl MemoryPage {
             let bytes = range.clone().map(|byte| {
                 let byte = Literal::u64_unsuffixed(byte);
                 if read {
-                    quote! { crate::buffer_mut(_start, _end, #byte, _buf) }
+                    quote! { &mut buffer_mut(_start, _end, #byte, _buf) }
                 } else {
-                    quote! { crate::buffer_const(_start, _end, #byte, _buf) }
+                    quote! { buffer_const(_start, _end, #byte, _buf) }
                 }
             });
             let reg_start = (range.start > 0).then_some(Literal::u64_unsuffixed(range.start)).into_iter();

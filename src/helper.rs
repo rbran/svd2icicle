@@ -56,55 +56,16 @@ pub fn read_write_generic_body(params: &[Ident]) -> impl ToTokens + '_ {
     struct Idents<'a>(&'a [Ident]);
     impl ToTokens for Idents<'_> {
         fn to_tokens(&self, tokens: &mut TokenStream) {
-            let params = &self.0;
-            let none_params = params.iter().map(|_| {
-                quote! { None }
-            });
-            let some_params = params.iter().map(|param| {
-                quote! { Some(#param) }
-            });
+            let params = self.0;
+            let none_params = params.iter().map(|_| quote! { None });
             tokens.extend(quote! {
-                let (#(#params),*) = match (#(#params),*) {
+                match (#(&#params),*) {
                     (#(#none_params),*) => unreachable!(),
-                    (#(#some_params),*) => (#(#params),*),
-                    _ => todo!(),
-                };
+                    _ => {},
+                }
                 todo!();
             });
         }
     }
     Idents(params)
-}
-
-pub fn gen_function_write_from_buffer(tokens: &mut TokenStream) {
-    tokens.extend(quote! {
-        pub fn buffer_mut(
-            _start: u64,
-            _end: u64,
-            _byte: u64,
-            _buf: &[u8],
-        ) -> Option<&mut u8> {
-            if _start > _byte || _end <= _byte {
-                return None;
-            }
-            let addr = _buf.as_ptr() as usize + (_byte - _start) as usize;
-            Some(unsafe { std::mem::transmute(addr) })
-        }
-    });
-}
-
-pub fn gen_function_read_from_buffer(tokens: &mut TokenStream) {
-    tokens.extend(quote! {
-        pub fn buffer_const(
-            _start: u64,
-            _end: u64,
-            _byte: u64,
-            _buf: &[u8],
-        ) -> Option<&u8> {
-            if _start > _byte || _end <= _byte {
-                return None;
-            }
-            Some(&_buf[(_byte - _start) as usize])
-        }
-    });
 }
