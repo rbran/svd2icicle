@@ -6,12 +6,16 @@ pub fn read_write_field(
     read: Option<&Ident>,
     write: Option<&Ident>,
     bytes: u32,
+    reset_value: u64,
+    reset_mask: u64,
     tokens: &mut TokenStream,
 ) {
     let dim = (dim > 1).then(|| quote! {_dim: usize});
     if bytes == 1 {
         if let Some(read) = read {
             tokens.extend(quote! { pub fn #read(&self, #dim) -> icicle_vm::cpu::mem::MemResult<u8> {
+                const _RESET_VALUE: u64 = #reset_value;
+                const _RESET_MASK: u64 = #reset_mask;
                 todo!()
             }})
         }
@@ -33,6 +37,8 @@ pub fn read_write_field(
                 }));
             tokens.extend(quote! {
                 pub fn #read(&self, #(#declare_params),*) -> icicle_vm::cpu::mem::MemResult<()> {
+                    const _RESET_VALUE: u64 = #reset_value;
+                    const _RESET_MASK: u64 = #reset_mask;
                     #body
                 }
             });
@@ -59,7 +65,7 @@ pub fn read_write_generic_body(params: &[Ident]) -> impl ToTokens + '_ {
             let params = self.0;
             let none_params = params.iter().map(|_| quote! { None });
             tokens.extend(quote! {
-                match (#(&#params),*) {
+                match (#(#params),*) {
                     (#(#none_params),*) => unreachable!(),
                     _ => {},
                 }

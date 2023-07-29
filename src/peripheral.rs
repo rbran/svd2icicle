@@ -76,7 +76,7 @@ impl<'a> Peripherals<'a> {
                     #(#regs_funs)*
                 }
             }
-            pub mod pages {
+            mod pages {
                 // helper functions to get buffer split
                 fn buffer_mut(
                     _start: u64,

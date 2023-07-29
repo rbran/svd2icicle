@@ -19,6 +19,8 @@ pub struct FieldAccess<'a> {
     pub read: Option<Ident>,
     pub write: Option<Ident>,
     pub data: FieldData,
+    pub reset_value: u64,
+    pub reset_mask: u64,
     pub fields: Vec<(&'a Peripheral, &'a Register, &'a Field)>,
 }
 
@@ -29,6 +31,8 @@ impl<'a> FieldAccess<'a> {
         per_name: &str,
         reg_name: &str,
         default_access: Access,
+        reg_reset_value: u64,
+        reg_reset_mask: u64,
     ) -> Result<Self> {
         // all fields names, used for error messages
         let field_names = || {
@@ -74,12 +78,18 @@ impl<'a> FieldAccess<'a> {
         let write = access.can_write().then(|| {
             format_ident!("write_{}_{}_{}", per_name, reg_name, &name)
         });
+
+        let bits = u64::MAX >> (u64::BITS - width);
+        let reset_value = (reg_reset_value >> fields[0].2.lsb()) & bits;
+        let reset_mask = (reg_reset_mask >> fields[0].2.lsb()) & bits;
         Ok(Self {
             dim,
             read,
             write,
             data,
             fields,
+            reset_value,
+            reset_mask,
         })
     }
 }
@@ -96,6 +106,8 @@ impl ToTokens for FieldAccess<'_> {
             self.read.as_ref(),
             self.write.as_ref(),
             bytes,
+            self.reset_value,
+            self.reset_mask,
             tokens,
         );
     }

@@ -16,6 +16,10 @@ pub struct RegisterAccess<'a> {
     pub bytes: u32,
     pub regs: Vec<&'a Register>,
     pub fields: Vec<FieldAccess<'a>>,
+    /// reset value, except for the fields (0s there)
+    pub clean_value: u64,
+    pub reset_value: u64,
+    pub reset_mask: u64,
 }
 
 impl<'a> RegisterAccess<'a> {
@@ -112,12 +116,45 @@ impl<'a> RegisterAccess<'a> {
                 .or_insert_with(|| vec![(per, reg, field)]);
         }
 
+        // all register need to have the same reset_value
+        let mut reset_value_mask_iter = regs.iter().map(|(_per, reg)| {
+            let value = reg.properties.reset_value.unwrap_or(0);
+            let mask = reg.properties.reset_mask.unwrap_or(u64::MAX);
+            (value, mask)
+        });
+        let (reset_value, reset_mask) = reset_value_mask_iter.next().unwrap();
+        if reset_value_mask_iter
+            .any(|other_reset| other_reset != (reset_value, reset_mask))
+        {
+            bail!(
+                "overlapping registers {} with diferent reset value/mask",
+                regs_names(),
+            )
+        }
+        // remove the fields from the reset value
+        let clean_value = fields.iter().fold(
+            reset_value & reset_mask,
+            |clean, (_offset, field)| {
+                let bits = u64::MAX >> (u64::BITS - field[0].2.bit_width());
+                let mask = bits << field[0].2.lsb();
+                clean & !mask
+            },
+        );
+
         // TODO check if the fields overlap or goes outside the register
         let fields = fields
             .into_iter()
             .map(|(_offset, fields)| {
                 // TODO compare field access with register access
-                FieldAccess::new(fields, dim, &per_name, &name, access)
+                FieldAccess::new(
+                    fields,
+                    dim,
+                    &per_name,
+                    &name,
+                    access,
+                    reset_value,
+                    reset_mask,
+                )
             })
             .collect::<Result<_, _>>()?;
 
@@ -130,6 +167,9 @@ impl<'a> RegisterAccess<'a> {
             write_fun,
             regs,
             fields,
+            clean_value,
+            reset_value,
+            reset_mask,
         })
     }
 
@@ -144,8 +184,14 @@ impl<'a> RegisterAccess<'a> {
     }
 
     fn gen_mem_map_functions(&self, tokens: &mut proc_macro2::TokenStream) {
+        // if this is a pseudo register, there is no need to create a function
+        // in pages, we can call the function from `Peripherals` directly
+        if self.fields.is_empty() {
+            return;
+        }
         let dim_declare = (self.dim > 1).then(|| quote! {_dim: usize,});
         let dim_use = (self.dim > 1).then(|| quote! {_dim,});
+        let clean_value = Literal::u64_unsuffixed(self.clean_value);
         if self.bytes == 1 {
             if let Some(read) = self.read_fun.as_ref() {
                 let fields = self.fields.iter().filter_map(|field| {
@@ -156,11 +202,11 @@ impl<'a> RegisterAccess<'a> {
                     })
                 });
                 tokens.extend(quote! {
-                    pub fn #read(
+                    fn #read(
                         &self,
                         #dim_declare
                     ) -> icicle_vm::cpu::mem::MemResult<u8> {
-                        let mut _value = 0;
+                        let mut _value = #clean_value;
                         #(_value |= #fields)*
                         Ok(value)
                     }
@@ -181,7 +227,7 @@ impl<'a> RegisterAccess<'a> {
                     })
                 });
                 tokens.extend(quote! {
-                    pub fn #write(
+                    fn #write(
                         &self,
                         #dim_declare
                         _value: u8
@@ -228,11 +274,20 @@ impl<'a> RegisterAccess<'a> {
                         },
                     )
                 });
+                let clean_bytes = params.iter().enumerate().map(|(i, param)| {
+                    let clean_value = Literal::u64_unsuffixed((self.clean_value >> (i * 8)) & u8::MAX as u64);
+                    quote! {
+                        if let Some(_byte) = #param {
+                            **_byte = #clean_value;
+                        }
+                    }
+                });
                 tokens.extend(quote! {
-                    pub fn #read(
+                    fn #read(
                         &self,
                         #dim_declare #(#declare_params),*
                     ) -> icicle_vm::cpu::mem::MemResult<()> {
+                        #(#clean_bytes)*
                         #(#fields)*
                         Ok(())
                     }
@@ -279,7 +334,7 @@ impl<'a> RegisterAccess<'a> {
                     )
                 });
                 tokens.extend(quote! {
-                    pub fn #write(
+                    fn #write(
                         &self,
                         #dim_declare #(#declare_params),*
                     ) -> icicle_vm::cpu::mem::MemResult<()> {
@@ -356,6 +411,8 @@ impl<'a> RegisterAccess<'a> {
                 self.read_fun.as_ref(),
                 self.write_fun.as_ref(),
                 self.bytes,
+                self.reset_value,
+                self.reset_mask,
                 tokens,
             )
         } else {
