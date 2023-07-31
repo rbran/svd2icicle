@@ -36,7 +36,7 @@ pub fn read_write_field(
                     quote! { #param: &mut Option<&mut u8> }
                 }));
             tokens.extend(quote! {
-                pub fn #read(&self, #(#declare_params),*) -> icicle_vm::cpu::mem::MemResult<()> {
+                pub fn #read(&mut self, #(#declare_params),*) -> icicle_vm::cpu::mem::MemResult<()> {
                     const _RESET_VALUE: u64 = #reset_value;
                     const _RESET_MASK: u64 = #reset_mask;
                     #body
@@ -50,7 +50,7 @@ pub fn read_write_field(
                     quote! { #param: Option<&u8> }
                 }));
             tokens.extend(quote! {
-                pub fn #write(&self, #(#declare_params),*) -> icicle_vm::cpu::mem::MemResult<()> {
+                pub fn #write(&mut self, #(#declare_params),*) -> icicle_vm::cpu::mem::MemResult<()> {
                     #body
                 }
             });
