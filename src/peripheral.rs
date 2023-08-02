@@ -84,6 +84,7 @@ impl<'a> Peripherals<'a> {
         // gen the empty struct, and read/write functions
         tokens.extend(quote! {
             mod pages {
+                use icicle_vm::cpu::mem::MemResult;
                 // helper functions to get buffer split
                 fn buffer_mut(
                     _start: u64,
@@ -111,7 +112,6 @@ impl<'a> Peripherals<'a> {
                 #(#pages)*
             }
         });
-        self.gen_map_pages(tokens);
     }
 
     #[allow(dead_code)]
