@@ -205,7 +205,7 @@ impl<'a> RegisterAccess<'a> {
                     fn #read(
                         &self,
                         #dim_declare
-                    ) -> icicle_vm::cpu::mem::MemResult<u8> {
+                    ) -> MemResult<u8> {
                         let mut _value = #clean_value;
                         #(_value |= #fields)*
                         Ok(value)
@@ -231,7 +231,7 @@ impl<'a> RegisterAccess<'a> {
                         &self,
                         #dim_declare
                         _value: u8
-                    ) -> icicle_vm::cpu::mem::MemResult<()> {
+                    ) -> MemResult<()> {
                         #(#fields)*
                         Ok(())
                     }
@@ -274,19 +274,22 @@ impl<'a> RegisterAccess<'a> {
                         },
                     )
                 });
-                let clean_bytes = params.iter().enumerate().map(|(i, param)| {
-                    let clean_value = Literal::u64_unsuffixed((self.clean_value >> (i * 8)) & u8::MAX as u64);
-                    quote! {
-                        if let Some(_byte) = #param {
-                            **_byte = #clean_value;
+                let clean_bytes =
+                    params.iter().enumerate().map(|(i, param)| {
+                        let clean_value = Literal::u64_unsuffixed(
+                            (self.clean_value >> (i * 8)) & u8::MAX as u64,
+                        );
+                        quote! {
+                            if let Some(_byte) = #param {
+                                **_byte = #clean_value;
+                            }
                         }
-                    }
-                });
+                    });
                 tokens.extend(quote! {
                     fn #read(
                         &self,
                         #dim_declare #(#declare_params),*
-                    ) -> icicle_vm::cpu::mem::MemResult<()> {
+                    ) -> MemResult<()> {
                         #(#clean_bytes)*
                         #(#fields)*
                         Ok(())
@@ -337,7 +340,7 @@ impl<'a> RegisterAccess<'a> {
                     fn #write(
                         &self,
                         #dim_declare #(#declare_params),*
-                    ) -> icicle_vm::cpu::mem::MemResult<()> {
+                    ) -> MemResult<()> {
                         #(#fields)*
                         Ok(())
                     }

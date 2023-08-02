@@ -13,7 +13,7 @@ pub fn read_write_field(
     let dim = (dim > 1).then(|| quote! {_dim: usize});
     if bytes == 1 {
         if let Some(read) = read {
-            tokens.extend(quote! { pub fn #read(&self, #dim) -> icicle_vm::cpu::mem::MemResult<u8> {
+            tokens.extend(quote! { pub fn #read(&self, #dim) -> MemResult<u8> {
                 const _RESET_VALUE: u64 = #reset_value;
                 const _RESET_MASK: u64 = #reset_mask;
                 todo!()
@@ -22,7 +22,7 @@ pub fn read_write_field(
         if let Some(write) = write.as_ref() {
             let dim = dim.into_iter();
             tokens.extend(quote! {
-                pub fn #write(&self, #(#dim,)* _value: u8) -> icicle_vm::cpu::mem::MemResult<()> {
+                pub fn #write(&self, #(#dim,)* _value: u8) -> MemResult<()> {
                     todo!()
             }})
         }
@@ -36,7 +36,7 @@ pub fn read_write_field(
                     quote! { #param: &mut Option<&mut u8> }
                 }));
             tokens.extend(quote! {
-                pub fn #read(&mut self, #(#declare_params),*) -> icicle_vm::cpu::mem::MemResult<()> {
+                pub fn #read(&mut self, #(#declare_params),*) -> MemResult<()> {
                     const _RESET_VALUE: u64 = #reset_value;
                     const _RESET_MASK: u64 = #reset_mask;
                     #body
@@ -50,7 +50,7 @@ pub fn read_write_field(
                     quote! { #param: Option<&u8> }
                 }));
             tokens.extend(quote! {
-                pub fn #write(&mut self, #(#declare_params),*) -> icicle_vm::cpu::mem::MemResult<()> {
+                pub fn #write(&mut self, #(#declare_params),*) -> MemResult<()> {
                     #body
                 }
             });

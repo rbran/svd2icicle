@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
-use svd_parser::svd::Peripheral;
+use svd_parser::svd::Device;
 
 use crate::{peripheral::Peripherals, register::RegisterAccess, PAGE_MASK};
 
@@ -53,7 +53,7 @@ impl MemoryPage {
                     &mut self,
                     _addr: u64,
                     _buf: &mut [u8],
-                ) -> icicle_vm::cpu::mem::MemResult<()> {
+                ) -> MemResult<()> {
                     let _start = _addr - #page_offset;
                     let _end = _start + u64::try_from(_buf.len()).unwrap();
                     match (_start, _end) {
@@ -66,7 +66,7 @@ impl MemoryPage {
                     &mut self,
                     _addr: u64,
                     _buf: &[u8],
-                ) -> icicle_vm::cpu::mem::MemResult<()> {
+                ) -> MemResult<()> {
                     let _start = _addr - #page_offset;
                     let _end = _start + u64::try_from(_buf.len()).unwrap();
                     match (_start, _end) {
@@ -169,11 +169,11 @@ pub struct MemoryChunk(pub Range<u64>);
 /// TODO check that each page is aligned
 pub fn pages_from_chunks(
     addr_bits: u32,
-    peripherals: &[Peripheral],
+    svds: &[Device],
 ) -> Vec<MemoryPage> {
     let page_mask = (u64::MAX >> addr_bits) << addr_bits;
     let mut chunks = Vec::new();
-    for per in peripherals.iter() {
+    for per in svds.iter().flat_map(|svd| svd.peripherals.iter()) {
         for reg in per.all_registers() {
             let start = per.base_address + reg.address_offset as u64;
             let bits = reg

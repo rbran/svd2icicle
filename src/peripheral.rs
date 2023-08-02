@@ -12,13 +12,13 @@ use crate::{memory::MemoryPage, ADDR_BITS};
 pub struct Peripherals<'a> {
     pub memory: Vec<MemoryPage>,
     pub registers: IndexMap<u64, RegisterAccess<'a>>,
-    pub svd: &'a Device,
+    pub svds: &'a [Device],
 }
 
 impl<'a> Peripherals<'a> {
-    pub fn new(svd: &'a Device) -> Result<Self> {
+    pub fn new(svds: &'a [Device]) -> Result<Self> {
         let mut registers: IndexMap<u64, Vec<_>> = IndexMap::new();
-        for per in svd.peripherals.iter() {
+        for per in svds.iter().flat_map(|x| x.peripherals.iter()) {
             for reg in per.registers() {
                 let addr = per.base_address + reg.address_offset as u64;
                 registers
@@ -33,10 +33,10 @@ impl<'a> Peripherals<'a> {
                 Ok::<_, anyhow::Error>((addr, RegisterAccess::new(regs)?))
             })
             .collect::<Result<_, _>>()?;
-        let memory = memory::pages_from_chunks(ADDR_BITS, &svd.peripherals);
+        let memory = memory::pages_from_chunks(ADDR_BITS, svds);
         Ok(Self {
             memory,
-            svd,
+            svds,
             registers,
         })
     }
@@ -58,15 +58,14 @@ impl<'a> Peripherals<'a> {
         })
     }
 
-    pub fn gen_all(&self, tokens: &mut TokenStream) {
+    fn gen_peripheral(&self, tokens: &mut TokenStream) {
         // the register/fields read/write functions
         let regs_funs =
             self.registers.values().map(|reg| reg.fields_functions());
         // all the memory blocks
-        let pages = self.memory.iter().map(|mem| mem.gen_pages(self));
-        // gen the empty struct, and read/write functions
         tokens.extend(quote! {
-            pub mod peripheral {
+            mod peripheral {
+                use icicle_vm::cpu::mem::MemResult;
                 #[derive(Default)]
                 pub struct Peripherals {
                     #[doc = "TODO: implement the peripherals data here"]
@@ -76,6 +75,14 @@ impl<'a> Peripherals<'a> {
                     #(#regs_funs)*
                 }
             }
+        });
+    }
+
+    fn gen_pages(&self, tokens: &mut TokenStream) {
+        // all the memory blocks
+        let pages = self.memory.iter().map(|mem| mem.gen_pages(self));
+        // gen the empty struct, and read/write functions
+        tokens.extend(quote! {
             mod pages {
                 // helper functions to get buffer split
                 fn buffer_mut(
@@ -104,6 +111,19 @@ impl<'a> Peripherals<'a> {
                 #(#pages)*
             }
         });
+        self.gen_map_pages(tokens);
+    }
+
+    #[allow(dead_code)]
+    pub fn gen_all_but_peripherals(&self, tokens: &mut TokenStream) {
+        self.gen_pages(tokens);
+        self.gen_map_pages(tokens);
+    }
+
+    #[allow(dead_code)]
+    pub fn gen_all(&self, tokens: &mut TokenStream) {
+        self.gen_peripheral(tokens);
+        self.gen_pages(tokens);
         self.gen_map_pages(tokens);
     }
 }
