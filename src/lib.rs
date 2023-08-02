@@ -25,7 +25,7 @@ pub fn gen_empty_implementation(svds: &[&Path], lib_rs: &Path) -> Result<()> {
     }).collect::<Result<Vec<_>,_>>()?;
     let peripherals = Peripherals::new(&svds)?;
     let mut output = TokenStream::new();
-    peripherals.gen_all_but_peripherals(&mut output);
+    peripherals.gen_all(&mut output);
     std::fs::write(lib_rs, output.to_string().as_bytes())?;
     Ok(())
 }

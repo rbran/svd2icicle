@@ -50,7 +50,7 @@ impl MemoryPage {
             );
             impl icicle_vm::cpu::mem::IoMemory for #pseudo_struct {
                 fn read(
-                    &self,
+                    &mut self,
                     _addr: u64,
                     _buf: &mut [u8],
                 ) -> MemResult<()> {
