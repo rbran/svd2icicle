@@ -228,7 +228,7 @@ impl<'a> RegisterAccess<'a> {
                 });
                 tokens.extend(quote! {
                     fn #write(
-                        &self,
+                        &mut self,
                         #dim_declare
                         _value: u8
                     ) -> MemResult<()> {
@@ -338,7 +338,7 @@ impl<'a> RegisterAccess<'a> {
                 });
                 tokens.extend(quote! {
                     fn #write(
-                        &self,
+                        &mut self,
                         #dim_declare #(#declare_params),*
                     ) -> MemResult<()> {
                         #(#fields)*
