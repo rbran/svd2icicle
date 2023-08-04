@@ -77,7 +77,7 @@ impl<'a> Peripherals<'a> {
             self.registers.values().map(|reg| reg.fields_functions());
         // all the memory blocks
         tokens.extend(quote! {
-            mod peripheral {
+            pub mod peripheral {
                 use icicle_vm::cpu::mem::MemResult;
                 #[derive(Default)]
                 pub struct Peripherals {
@@ -98,30 +98,6 @@ impl<'a> Peripherals<'a> {
         tokens.extend(quote! {
             mod pages {
                 use icicle_vm::cpu::mem::MemResult;
-                // helper functions to get buffer split
-                fn buffer_mut(
-                    _start: u64,
-                    _end: u64,
-                    _byte: u64,
-                    _buf: &[u8],
-                ) -> Option<&mut u8> {
-                    if _start > _byte || _end <= _byte {
-                        return None;
-                    }
-                    let addr = _buf.as_ptr() as usize + (_byte - _start) as usize;
-                    Some(unsafe { std::mem::transmute(addr) })
-                }
-                fn buffer_const(
-                    _start: u64,
-                    _end: u64,
-                    _byte: u64,
-                    _buf: &[u8],
-                ) -> Option<&u8> {
-                    if _start > _byte || _end <= _byte {
-                        return None;
-                    }
-                    Some(&_buf[(_byte - _start) as usize])
-                }
                 #(#pages)*
             }
         });

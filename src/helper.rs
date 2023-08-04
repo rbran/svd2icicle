@@ -1,13 +1,47 @@
 use proc_macro2::{Ident, TokenStream};
-use quote::{format_ident, quote};
+use quote::{quote, ToTokens};
 
 use crate::field::FieldData;
 
-fn byte_type(bits: u32) -> TokenStream {
-    match bits {
-        0 => unreachable!(),
-        1 => quote! {bool},
-        _ => quote! {u8},
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DataType {
+    Bool,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+}
+
+impl DataType {
+    #[inline]
+    pub fn from_bytes(bytes: u32) -> Self {
+        Self::from_bits(bytes * 8)
+    }
+    pub fn from_bits(bits: u32) -> Self {
+        match bits {
+            0 => unreachable!(),
+            1 => Self::Bool,
+            ..=8 => Self::U8,
+            ..=16 => Self::U16,
+            ..=32 => Self::U32,
+            ..=64 => Self::U64,
+            ..=128 => Self::U128,
+            _ => todo!(),
+        }
+    }
+}
+
+impl ToTokens for DataType {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        tokens.extend(match self {
+            DataType::Bool => quote! {bool},
+            DataType::U8 => quote! {u8},
+            DataType::U16 => quote! {u16},
+            DataType::U32 => quote! {u32},
+            DataType::U64 => quote! {u64},
+            DataType::U128 => quote! {u128},
+        })
     }
 }
 
@@ -43,7 +77,7 @@ pub fn read_write_field(
     };
     let dim = (dim > 1).then(|| quote! {_dim: usize});
     if let FieldData::Single(bits) = data {
-        let value_type = byte_type(bits);
+        let value_type = DataType::from_bits(bits);
         if let Some(read) = read {
             let todo_msg = todo_msg(true);
             tokens.extend(quote! {
@@ -65,33 +99,24 @@ pub fn read_write_field(
             }})
         }
     } else {
-        let params: Box<[_]> = (0..data.bytes())
-            .map(|i| format_ident!("_byte_{}", i))
-            .collect();
+        let value_type = DataType::from_bytes(data.bytes());
         if let Some(read) = read.as_ref() {
-            let declare_params =
-                dim.clone().into_iter().chain(params.iter().map(|param| {
-                    quote! { #param: &mut Option<&mut u8> }
-                }));
             let todo_msg = todo_msg(true);
             tokens.extend(quote! {
                 #[doc = #doc]
                 #[inline]
-                pub fn #read(&self, #(#declare_params),*) -> MemResult<()> {
+                pub fn #read(&self, #dim) -> MemResult<#value_type> {
                     todo!(#todo_msg)
                 }
             });
         }
         if let Some(write) = write.as_ref() {
-            let declare_params =
-                dim.into_iter().chain(params.iter().map(|param| {
-                    quote! { #param: Option<&u8> }
-                }));
+            let dim = dim.into_iter();
             let todo_msg = todo_msg(false);
             tokens.extend(quote! {
                 #[doc = #doc]
                 #[inline]
-                pub fn #write(&mut self, #(#declare_params),*) -> MemResult<()> {
+                pub fn #write(&mut self, #(#dim,)* _value: #value_type) -> MemResult<()> {
                     todo!(#todo_msg)
                 }
             });

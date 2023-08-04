@@ -190,6 +190,7 @@ impl<'a> RegisterAccess<'a> {
         let dim_declare = (self.dim > 1).then(|| quote! {_dim: usize,});
         let dim_use = (self.dim > 1).then(|| quote! {_dim,});
         let clean_value = Literal::u64_unsuffixed(self.clean_value);
+        let value_type = helper::DataType::from_bytes(self.bytes);
         if self.bytes == 1 {
             if let Some(read) = self.read_fun.as_ref() {
                 let fields = self.fields.iter().filter_map(|field| {
@@ -203,7 +204,7 @@ impl<'a> RegisterAccess<'a> {
                     fn #read(
                         &self,
                         #dim_declare
-                    ) -> MemResult<u8> {
+                    ) -> MemResult<#value_type> {
                         let mut _value = #clean_value;
                         #(_value |= #fields)*
                         Ok(value)
@@ -212,7 +213,7 @@ impl<'a> RegisterAccess<'a> {
             }
             if let Some(write) = self.write_fun.as_ref() {
                 let fields = self.fields.iter().filter_map(|field| {
-                    let field_fun = field.read.as_ref()?;
+                    let field_fun = field.write.as_ref()?;
                     let lsb = field.fields[0].2.lsb();
                     let mask =
                         u8::MAX >> (u8::BITS - field.fields[0].2.bit_width());
@@ -228,7 +229,7 @@ impl<'a> RegisterAccess<'a> {
                     fn #write(
                         &mut self,
                         #dim_declare
-                        _value: u8
+                        _value: #value_type,
                     ) -> MemResult<()> {
                         #(#fields)*
                         Ok(())
@@ -236,108 +237,56 @@ impl<'a> RegisterAccess<'a> {
                 })
             }
         } else {
-            let params: Box<[_]> = (0..self.bytes)
-                .map(|i| format_ident!("_byte_{}", i))
-                .collect();
             if let Some(read) = self.read_fun.as_ref() {
-                let declare_params = params.iter().map(|param| {
-                    quote! { #param: &mut Option<&mut u8> }
+                let fields = self.fields.iter().map(|field| {
+                    let read = field.read.as_ref().unwrap();
+                    let lsb = field.fields[0].2.lsb();
+                    quote! {
+                        _value |= #value_type::from(
+                            self.0.lock().unwrap().#read(#dim_use)?
+                        ) << #lsb;
+                    }
                 });
-                let fields = self.fields.iter().filter_map(|field| {
-                    self.gen_field_register(
-                        &params,
-                        field.read.as_ref()?,
-                        field,
-                        |byte_match, field_fun, lsb| {
-                            quote! {
-                                if let Some(byte) = #byte_match {
-                                    **byte |= self
-                                        .0
-                                        .lock()
-                                        .unwrap()
-                                        .#field_fun(#dim_use)? << #lsb;
-                                }
-                            }
-                        },
-                        |field_fun, params| {
-                            quote! {
-                                if #(#params.is_some())||* {
-                                    self
-                                        .0
-                                        .lock()
-                                        .unwrap()
-                                        .#field_fun(#dim_use #(#params),*)?;
-                                }
-                            }
-                        },
-                    )
-                });
-                let clean_bytes =
-                    params.iter().enumerate().map(|(i, param)| {
-                        let clean_value = Literal::u64_unsuffixed(
-                            (self.clean_value >> (i * 8)) & u8::MAX as u64,
-                        );
-                        quote! {
-                            if let Some(_byte) = #param {
-                                **_byte = #clean_value;
-                            }
-                        }
-                    });
+                let clean_value = Literal::u64_unsuffixed(self.clean_value);
                 tokens.extend(quote! {
-                    fn #read(
-                        &self,
-                        #dim_declare #(#declare_params),*
-                    ) -> MemResult<()> {
-                        #(#clean_bytes)*
+                    // NOTE no comma on dim_declare
+                    fn #read(&self, #dim_declare) -> MemResult<#value_type> {
+                        let mut _value = #clean_value;
                         #(#fields)*
-                        Ok(())
+                        Ok(_value)
                     }
                 });
             }
             if let Some(write) = self.write_fun.as_ref() {
-                let declare_params = params.iter().map(|param| {
-                    quote! { #param: Option<&u8> }
-                });
-                let fields = self.fields.iter().filter_map(|field| {
-                    self.gen_field_register(
-                        &params,
-                        field.write.as_ref()?,
-                        field,
-                        |byte_match, field_fun, lsb| {
-                            let mask = Literal::u8_unsuffixed(
-                                u8::MAX
-                                    >> (u8::BITS
-                                        - field.fields[0].2.bit_width()),
-                            );
-                            quote! {
-                                if let Some(byte) = #byte_match {
-                                    self
-                                        .0
-                                        .lock()
-                                        .unwrap()
-                                        .#field_fun(
-                                            #dim_use (*byte >> #lsb) & #mask
-                                        )?;
-                                }
-                            }
-                        },
-                        |field_fun, params| {
-                            quote! {
-                                if #(#params.is_some())||* {
-                                    self
-                                        .0
-                                        .lock()
-                                        .unwrap()
-                                        .#field_fun(#dim_use #(#params,)*)?;
-                                }
-                            }
-                        },
-                    )
+                let fields = self.fields.iter().map(|field| {
+                    let lsb = field.fields[0].2.lsb();
+                    let bits = field.fields[0].2.bit_width();
+                    let write = field.write.as_ref().unwrap();
+                    if bits == 1 {
+                        quote! {
+                            self.0.lock().unwrap().#write(
+                                #dim_use ((_value >> #lsb) & 1) != 0
+                            )?;
+                        }
+                    } else {
+                        let mask = Literal::u128_unsuffixed(
+                            u128::MAX
+                                >> (u128::BITS
+                                    - field.fields[0].2.bit_width()),
+                        );
+                        quote! {
+                            self.0.lock().unwrap().#write(
+                                #dim_use ((_value >> #lsb) & #mask).try_into().unwrap()
+                            )?;
+                        }
+                    }
                 });
                 tokens.extend(quote! {
+                    // NOTE no comma on dim_declare
                     fn #write(
                         &mut self,
-                        #dim_declare #(#declare_params),*
+                        #dim_declare
+                        _value: #value_type,
                     ) -> MemResult<()> {
                         #(#fields)*
                         Ok(())
@@ -347,60 +296,25 @@ impl<'a> RegisterAccess<'a> {
         }
     }
 
-    fn gen_field_register<S, M>(
+    pub fn gen_mem_page_function_call(
         &self,
-        params: &[Ident],
-        field_fun: &Ident,
-        field: &FieldAccess,
-        mut caller_single: S,
-        mut caller_multiple: M,
-    ) -> Option<TokenStream>
-    where
-        S: FnMut(&Ident, &Ident, Literal) -> TokenStream,
-        M: FnMut(&Ident, &[Ident]) -> TokenStream,
-    {
-        let lsb = field.fields[0].2.lsb();
-        let first_byte = (lsb / 8) as usize;
-        match field.data {
-            FieldData::Single(_bits) => {
-                let byte_match = &params[first_byte];
-                let lsb = Literal::u32_unsuffixed(lsb % 8);
-                Some(caller_single(byte_match, field_fun, lsb))
-            }
-            FieldData::Multiple { first, bytes, last } => {
-                let last_byte = first_byte
-                    + (first != 0) as usize
-                    + (last != 0) as usize
-                    + bytes as usize;
-                let params = &params[first_byte..last_byte];
-                Some(caller_multiple(field_fun, params))
-            }
-        }
-    }
-
-    pub fn gen_mem_page_function_call<I>(
-        &self,
-        read: bool,
         dim: Option<Literal>,
-        params: I,
-    ) -> Option<TokenStream>
-    where
-        I: Iterator<Item = TokenStream>,
-    {
-        let fun = if read {
-            self.read_fun.as_ref()?
-        } else {
+        param: Option<&Ident>,
+    ) -> Option<TokenStream> {
+        let fun = if param.is_some() {
             self.write_fun.as_ref()?
+        } else {
+            self.read_fun.as_ref()?
         };
         // if implicity field, use the peripheral call directly, otherwise
         // call the register implementation from the pages struct
         let dim = dim.into_iter();
         if self.fields.is_empty() {
             Some(quote! {
-                self.0.lock().unwrap().#fun(#(#dim,)* #(#params),*)?;
+                self.0.lock().unwrap().#fun(#(#dim,)* #param)?
             })
         } else {
-            Some(quote! { self.#fun(#(#dim,)* #(#params),*)?; })
+            Some(quote! { self.#fun(#(#dim,)* #param)? })
         }
     }
 

@@ -134,7 +134,7 @@ impl ToTokens for FieldAccess<'_> {
                     per.name(),
                     reg.name(),
                     field.name(),
-                    reg.description.as_ref()?,
+                    field.description.as_ref()?,
                 ))
             })
             .collect();

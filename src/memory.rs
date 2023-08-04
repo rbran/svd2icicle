@@ -4,7 +4,7 @@ use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::Device;
 
-use crate::{peripheral::Peripherals, register::RegisterAccess, PAGE_MASK};
+use crate::{peripheral::Peripherals, register::RegisterAccess, PAGE_MASK, helper};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryPage {
@@ -135,27 +135,53 @@ impl MemoryPage {
             let reg_end = reg_start + reg.bytes as u64;
             chunk.0.contains(&reg_addr_start).then_some((dim_i, reg_start..reg_end))
         }).map(move |(dim_i, range)| {
-            let bytes = range.clone().map(|byte| {
+            let value = format_ident!("_value");
+            let value_type = helper::DataType::from_bytes(reg.bytes);
+            let bytes = range.clone().enumerate().map(|(byte_i, byte)| {
                 let byte = Literal::u64_unsuffixed(byte);
                 if read {
-                    quote! { &mut buffer_mut(_start, _end, #byte, _buf) }
+                    quote!{
+                        if _start <= #byte && _end > #byte {
+                            _buf[(#byte - _start) as usize] = ((#value >> #byte_i) & 0xff) as u8;
+                        }
+                    }
                 } else {
-                    quote! { buffer_const(_start, _end, #byte, _buf) }
+                    quote!{
+                        if _start <= #byte && _end > #byte {
+                            #value |= (_buf[(#byte - _start) as usize] << #byte_i) as #value_type;
+                        }
+                    }
                 }
             });
             let reg_start = (range.start > 0).then_some(Literal::u64_unsuffixed(range.start)).into_iter();
             let reg_start2 = reg_start.clone();
             let reg_end = Literal::u64_unsuffixed(range.end);
             let dim = (reg.dim > 1).then(|| Literal::u32_unsuffixed(dim_i));
-            let call = reg.gen_mem_page_function_call(read, dim, bytes).unwrap_or_else(||
-                quote! {
-                    return Err(icicle_vm::cpu::mem::MemError::WriteViolation);
-                }
-            );
+            let call = reg
+                .gen_mem_page_function_call(dim, (!read).then_some(&value))
+                .map(|call| {
+                    if read {
+                        quote!{
+                            let #value = #call;
+                            #(#bytes)*
+                        }
+                    } else {
+                        quote!{
+                            let mut #value = 0;
+                            #(#bytes)*
+                            #call;
+                        }
+                    }
+                })
+                .unwrap_or_else(||
+                    quote! {
+                        return Err(icicle_vm::cpu::mem::MemError::WriteViolation);
+                    }
+                );
             quote! {
                 if (#(_start >= #reg_start &&)* _start < #reg_end)
                     || (#(_end > #reg_start2 &&)* _end <= #reg_end) {
-                    #call
+                        #call
                 }
             }
         })
@@ -167,10 +193,7 @@ pub struct MemoryChunk(pub Range<u64>);
 
 /// create a page-mapped list of peripherals
 /// TODO check that each page is aligned
-pub fn pages_from_chunks(
-    addr_bits: u32,
-    svds: &[Device],
-) -> Vec<MemoryPage> {
+pub fn pages_from_chunks(addr_bits: u32, svds: &[Device]) -> Vec<MemoryPage> {
     let page_mask = (u64::MAX >> addr_bits) << addr_bits;
     let mut chunks = Vec::new();
     for per in svds.iter().flat_map(|svd| svd.peripherals.iter()) {
