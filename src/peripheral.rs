@@ -18,13 +18,26 @@ pub struct Peripherals<'a> {
 impl<'a> Peripherals<'a> {
     pub fn new(svds: &'a [Device]) -> Result<Self> {
         let mut registers: IndexMap<u64, Vec<_>> = IndexMap::new();
-        for per in svds.iter().flat_map(|x| x.peripherals.iter()) {
-            for reg in per.registers() {
-                let addr = per.base_address + reg.address_offset as u64;
-                registers
-                    .entry(addr)
-                    .and_modify(|regs| regs.push((per, reg)))
-                    .or_insert_with(|| vec![(per, reg)]);
+        for svd in svds {
+            for per in svd.peripherals.iter() {
+                // only allow derived if there is no registers, and vise-versa
+                assert!(
+                    per.derived_from.is_some() ^ (per.registers().count() > 0)
+                );
+                let per = if let Some(derived) = per.derived_from.as_ref() {
+                    let derived = svd.get_peripheral(derived).unwrap();
+                    assert!(derived.registers().count() > 0);
+                    derived
+                } else {
+                    per
+                };
+                for reg in per.registers() {
+                    let addr = per.base_address + reg.address_offset as u64;
+                    registers
+                        .entry(addr)
+                        .and_modify(|regs| regs.push((per, reg)))
+                        .or_insert_with(|| vec![(per, reg)]);
+                }
             }
         }
         let registers = registers
