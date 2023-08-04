@@ -140,12 +140,14 @@ impl MemoryPage {
             let bytes = range.clone().enumerate().map(|(byte_i, byte)| {
                 let byte = Literal::u64_unsuffixed(byte);
                 if read {
+                    // TODO implement byte endian here
                     quote!{
                         if _start <= #byte && _end > #byte {
                             _buf[(#byte - _start) as usize] = ((#value >> #byte_i) & 0xff) as u8;
                         }
                     }
                 } else {
+                    // TODO implement byte endian here
                     quote!{
                         if _start <= #byte && _end > #byte {
                             #value |= (_buf[(#byte - _start) as usize] << #byte_i) as #value_type;

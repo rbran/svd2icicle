@@ -171,6 +171,29 @@ impl<'a> RegisterAccess<'a> {
         })
     }
 
+    /// true if is compose of a single field with the same len then the register
+    fn is_single_field(&self) -> bool {
+        // if no fields, means it is a single implicit field
+        if self.fields.is_empty() {
+            return true;
+        }
+
+        // only one field and it have the same size then the register
+        if self.fields.len() == 1 {
+            match self.fields[0].data {
+                FieldData::Single(8) if self.bytes == 1 => true,
+                FieldData::Multiple {
+                    first: 0,
+                    bytes,
+                    last: 0,
+                } if self.bytes == bytes => true,
+                _ => false,
+            }
+        } else {
+            false
+        }
+    }
+
     pub fn mem_map_functions(&self) -> impl ToTokens + '_ {
         struct Tokens<'a, 'b: 'a>(&'b RegisterAccess<'a>);
         impl ToTokens for Tokens<'_, '_> {
@@ -182,9 +205,9 @@ impl<'a> RegisterAccess<'a> {
     }
 
     fn gen_mem_map_functions(&self, tokens: &mut proc_macro2::TokenStream) {
-        // if this is a pseudo register, there is no need to create a function
+        // if is single fields, there is no need to create a function
         // in pages, we can call the function from `Peripherals` directly
-        if self.fields.is_empty() {
+        if self.is_single_field() {
             return;
         }
         let dim_declare = (self.dim > 1).then(|| quote! {_dim: usize,});
@@ -306,10 +329,10 @@ impl<'a> RegisterAccess<'a> {
         } else {
             self.read_fun.as_ref()?
         };
-        // if implicity field, use the peripheral call directly, otherwise
+        // if single field, use the peripheral call directly, otherwise
         // call the register implementation from the pages struct
         let dim = dim.into_iter();
-        if self.fields.is_empty() {
+        if self.is_single_field() {
             Some(quote! {
                 self.0.lock().unwrap().#fun(#(#dim,)* #param)?
             })
@@ -319,8 +342,7 @@ impl<'a> RegisterAccess<'a> {
     }
 
     fn gen_fields_functions(&self, tokens: &mut TokenStream) {
-        // if no fields, means it is a single implicit field
-        if self.fields.is_empty() {
+        if self.is_single_field() {
             let docs: Vec<_> = self
                 .regs
                 .iter()
