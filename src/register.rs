@@ -14,7 +14,7 @@ pub struct RegisterAccess<'a> {
     pub write_fun: Option<Ident>,
     pub dim: u32,
     pub bytes: u32,
-    pub regs: Vec<&'a Register>,
+    pub regs: Vec<(&'a Peripheral, &'a Register)>,
     pub fields: Vec<FieldAccess<'a>>,
     /// reset value, except for the fields (0s there)
     pub clean_value: u64,
@@ -157,8 +157,6 @@ impl<'a> RegisterAccess<'a> {
                 )
             })
             .collect::<Result<_, _>>()?;
-
-        let regs = regs.into_iter().map(|(_per, reg)| reg).collect();
 
         Ok(Self {
             dim,
@@ -409,13 +407,34 @@ impl<'a> RegisterAccess<'a> {
     fn gen_fields_functions(&self, tokens: &mut TokenStream) {
         // if no fields, means it is a single implicit field
         if self.fields.is_empty() {
+            let docs: Vec<_> = self
+                .regs
+                .iter()
+                .filter_map(|(per, reg)| {
+                    Some(format!(
+                        "{} {}: {}",
+                        per.name(),
+                        reg.name(),
+                        reg.description.as_ref()?,
+                    ))
+                })
+                .collect();
+            let docs = docs.join("\n\n");
+            let name: Vec<_> = self
+                .regs
+                .iter()
+                .map(|(per, reg)| format!("{} {}", per.name(), reg.name()))
+                .collect();
+            let name = name.join(", ");
             helper::read_write_field(
                 self.dim,
+                &name,
                 self.read_fun.as_ref(),
                 self.write_fun.as_ref(),
-                self.bytes,
+                FieldData::from_bytes(self.bytes),
                 self.reset_value,
                 self.reset_mask,
+                &docs,
                 tokens,
             )
         } else {

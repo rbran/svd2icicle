@@ -13,6 +13,36 @@ pub enum FieldData {
     Multiple { first: u32, bytes: u32, last: u32 },
 }
 
+impl FieldData {
+    pub fn from_bytes(bytes: u32) -> Self {
+        match bytes {
+            0 => unreachable!(),
+            1 => Self::Single(8),
+            bytes => Self::Multiple {
+                first: 0,
+                bytes,
+                last: 0,
+            },
+        }
+    }
+    pub fn bits(&self) -> u32 {
+        match *self {
+            FieldData::Single(bits) => bits,
+            FieldData::Multiple { first, bytes, last } => {
+                first + (bytes * 8) + last
+            }
+        }
+    }
+    pub fn bytes(&self) -> u32 {
+        match *self {
+            FieldData::Single(bits) => (bits + 7) / 8,
+            FieldData::Multiple { first, bytes, last } => {
+                (first != 0) as u32 + bytes + (last != 0) as u32
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct FieldAccess<'a> {
     pub dim: u32,
@@ -95,19 +125,37 @@ impl<'a> FieldAccess<'a> {
 }
 impl ToTokens for FieldAccess<'_> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        let bytes = match self.data {
-            FieldData::Single(_) => 1,
-            FieldData::Multiple { first, bytes, last } => {
-                bytes + (first != 0) as u32 + (last != 0) as u32
-            }
-        };
+        let docs: Vec<_> = self
+            .fields
+            .iter()
+            .filter_map(|(per, reg, field)| {
+                Some(format!(
+                    "{} {} {}: {}",
+                    per.name(),
+                    reg.name(),
+                    field.name(),
+                    reg.description.as_ref()?,
+                ))
+            })
+            .collect();
+        let docs = docs.join("\n\n");
+        let name: Vec<_> = self
+            .fields
+            .iter()
+            .map(|(per, reg, field)| {
+                format!("{} {} {}", per.name(), reg.name(), field.name())
+            })
+            .collect();
+        let name = name.join(", ");
         helper::read_write_field(
             self.dim,
+            &name,
             self.read.as_ref(),
             self.write.as_ref(),
-            bytes,
+            self.data,
             self.reset_value,
             self.reset_mask,
+            &docs,
             tokens,
         );
     }

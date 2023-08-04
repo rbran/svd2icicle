@@ -29,8 +29,8 @@ impl<'a> Peripherals<'a> {
         }
         let registers = registers
             .into_iter()
-            .map(|(addr, regs)| {
-                Ok::<_, anyhow::Error>((addr, RegisterAccess::new(regs)?))
+            .map(|(addr, regs)| -> Result<_> {
+                Ok((addr, RegisterAccess::new(regs)?))
             })
             .collect::<Result<_, _>>()?;
         let memory = memory::pages_from_chunks(ADDR_BITS, svds);
