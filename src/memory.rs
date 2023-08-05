@@ -4,7 +4,9 @@ use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::Device;
 
-use crate::{peripheral::Peripherals, register::RegisterAccess, PAGE_MASK, helper};
+use crate::{
+    helper, peripheral::Peripherals, register::RegisterAccess, PAGE_MASK,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryPage {
@@ -58,9 +60,8 @@ impl MemoryPage {
                     let _end = _start + u64::try_from(_buf.len()).unwrap();
                     match (_start, _end) {
                         #read
-                        _ => return Err(icicle_vm::cpu::mem::MemError::Unmapped),
+                        _ => return Err(MemError::Unmapped),
                     }
-                    Ok(())
                 }
                 fn write(
                     &mut self,
@@ -71,9 +72,8 @@ impl MemoryPage {
                     let _end = _start + u64::try_from(_buf.len()).unwrap();
                     match (_start, _end) {
                         #write
-                        _ => return Err(icicle_vm::cpu::mem::MemError::Unmapped),
+                        _ => return Err(MemError::Unmapped),
                     }
-                    Ok(())
                 }
             }
             impl #pseudo_struct {
@@ -90,51 +90,64 @@ impl MemoryPage {
         let page_offset = self.addr;
         let start = chunk.0.start - page_offset;
         let end = chunk.0.end - page_offset;
-        let registers_read =
-            peripherals.registers.iter().flat_map(|(addr, reg)| {
-                self.call_register_from_chunk(chunk, *addr, reg, true)
-            });
-        let registers_write =
-            peripherals.registers.iter().flat_map(|(addr, reg)| {
-                self.call_register_from_chunk(chunk, *addr, reg, false)
-            });
+        let registers_in_chunk = peripherals
+            .registers
+            .iter()
+            .filter(|(addr, _reg)| chunk.0.contains(*addr));
+        // NOTE is very common to have a entier block read/write only, so
+        // if this is the case return an error for the block.
         let startp1 = Literal::u64_unsuffixed(start + 1);
         let start = (start != 0).then_some(Literal::u64_unsuffixed(start));
         let endm1 = Literal::u64_unsuffixed(end - 1);
         let end = Literal::u64_unsuffixed(end);
-        (
+        let read = if registers_in_chunk
+            .clone()
+            .all(|(_addr, reg)| reg.read_fun.is_none())
+        {
+            quote! { (#start..=#endm1, #startp1..=#end) => return Err(MemError::ReadViolation), }
+        } else {
+            let registers_read =
+                registers_in_chunk.clone().flat_map(|(addr, reg)| {
+                    self.call_register_from_chunk(*addr, reg, true)
+                });
             quote! {
                 (#start..=#endm1, #startp1..=#end) => {
                     #(#registers_read)*
+                    Ok(())
                 },
-            },
+            }
+        };
+        let write = if registers_in_chunk
+            .clone()
+            .all(|(_addr, reg)| reg.write_fun.is_none())
+        {
+            quote! { (#start..=#endm1, #startp1..=#end) => return Err(MemError::WriteViolation), }
+        } else {
+            let registers_write = registers_in_chunk.flat_map(|(addr, reg)| {
+                self.call_register_from_chunk(*addr, reg, false)
+            });
             quote! {
                 (#start..=#endm1, #startp1..=#end) => {
                     #(#registers_write)*
+                    Ok(())
                 },
-            },
-        )
+            }
+        };
+        (read, write)
     }
 
     fn call_register_from_chunk<'b>(
         &'b self,
-        chunk: &'b MemoryChunk,
         base_addr: u64,
         reg: &'b RegisterAccess,
         read: bool,
     ) -> impl Iterator<Item = TokenStream> + 'b {
-        (0..reg.dim).filter_map(move |dim_i| {
-            // register is not in this memory page
-            if base_addr < self.addr {
-                return None;
-            }
+        (0..reg.dim).map(move |dim_i| {
             let chunk_offset = base_addr - self.addr;
             let dim_offset = dim_i as u64 * reg.bytes as u64;
-            let reg_addr_start = base_addr + dim_offset;
             let reg_start = chunk_offset + dim_offset;
             let reg_end = reg_start + reg.bytes as u64;
-            chunk.0.contains(&reg_addr_start).then_some((dim_i, reg_start..reg_end))
-        }).map(move |(dim_i, range)| {
+            let range = reg_start..reg_end;
             let value = format_ident!("_value");
             let value_type = helper::DataType::from_bytes(reg.bytes);
             let bytes = range.clone().enumerate().map(|(byte_i, byte)| {
@@ -177,7 +190,7 @@ impl MemoryPage {
                 })
                 .unwrap_or_else(||
                     quote! {
-                        return Err(icicle_vm::cpu::mem::MemError::WriteViolation);
+                        return Err(MemError::WriteViolation);
                     }
                 );
             quote! {

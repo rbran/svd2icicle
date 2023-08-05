@@ -97,7 +97,7 @@ impl<'a> Peripherals<'a> {
         // gen the empty struct, and read/write functions
         tokens.extend(quote! {
             mod pages {
-                use icicle_vm::cpu::mem::MemResult;
+                use icicle_vm::cpu::mem::{MemError, MemResult};
                 #(#pages)*
             }
         });
