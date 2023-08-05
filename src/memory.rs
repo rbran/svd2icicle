@@ -150,53 +150,83 @@ impl MemoryPage {
             let range = reg_start..reg_end;
             let value = format_ident!("_value");
             let value_type = helper::DataType::from_bytes(reg.bytes);
-            let bytes = range.clone().enumerate().map(|(byte_i, byte)| {
-                let byte = Literal::u64_unsuffixed(byte);
-                if read {
+            let reg_start = (range.start > 0).then_some(Literal::u64_unsuffixed(range.start)).into_iter();
+            let reg_start2 = reg_start.clone();
+            let reg_end = Literal::u64_unsuffixed(range.end);
+            let dim = (reg.dim > 1).then(|| Literal::u32_unsuffixed(dim_i));
+            if read {
+                let bytes = range.enumerate().map(|(byte_i, byte)| {
+                    let byte = Literal::u64_unsuffixed(byte);
+                    let byte_i = Literal::usize_unsuffixed(byte_i);
                     // TODO implement byte endian here
                     quote!{
                         if _start <= #byte && _end > #byte {
                             _buf[(#byte - _start) as usize] = ((#value >> #byte_i) & 0xff) as u8;
                         }
                     }
-                } else {
-                    // TODO implement byte endian here
-                    quote!{
-                        if _start <= #byte && _end > #byte {
-                            #value |= (_buf[(#byte - _start) as usize] << #byte_i) as #value_type;
-                        }
-                    }
-                }
-            });
-            let reg_start = (range.start > 0).then_some(Literal::u64_unsuffixed(range.start)).into_iter();
-            let reg_start2 = reg_start.clone();
-            let reg_end = Literal::u64_unsuffixed(range.end);
-            let dim = (reg.dim > 1).then(|| Literal::u32_unsuffixed(dim_i));
-            let call = reg
-                .gen_mem_page_function_call(dim, (!read).then_some(&value))
-                .map(|call| {
-                    if read {
+                });
+                let call = reg
+                    .gen_mem_page_function_call(dim, None)
+                    .map(|call| {
                         quote!{
                             let #value = #call;
                             #(#bytes)*
                         }
-                    } else {
+                    })
+                    .unwrap_or_else(||
+                        quote! {
+                            return Err(MemError::ReadViolation);
+                        }
+                    );
+                quote! {
+                    if (#(_start >= #reg_start &&)* _start < #reg_end)
+                        || (#(_end > #reg_start2 &&)* _end <= #reg_end) {
+                            #call
+                    }
+                }
+            }else {
+                let bytes = range.enumerate().map(|(byte_i, byte)| {
+                    let byte = Literal::u64_unsuffixed(byte);
+                    let byte_i = Literal::usize_unsuffixed(byte_i);
+                    // TODO implement byte endian here
+                    // TODO allow partial writes to registers?
+                    // TODO pass the &mut u32 directly if data allign?
+                    quote!{
+                        #value |= (_buf[(#byte - _start) as usize] << #byte_i) as #value_type;
+                    }
+                });
+                let call = reg
+                    .gen_mem_page_function_call(dim, Some(&value))
+                    .map(|call| {
                         quote!{
                             let mut #value = 0;
                             #(#bytes)*
                             #call;
                         }
-                    }
-                })
-                .unwrap_or_else(||
-                    quote! {
-                        return Err(MemError::WriteViolation);
-                    }
+                    })
+                    .unwrap_or_else(||
+                        quote! {
+                            return Err(MemError::WriteViolation);
+                        }
+                    );
+                // TODO allow partial writes to registers?
+                // TODO pass the &mut u32 directly if data allign?
+                let part_no_impl = format!(
+                    "partial write ({{}}:{{}}) for {} {} not implemented",
+                    &reg.regs[0].0.name,
+                    &reg.regs[0].1.name,
                 );
-            quote! {
-                if (#(_start >= #reg_start &&)* _start < #reg_end)
-                    || (#(_end > #reg_start2 &&)* _end <= #reg_end) {
+                let reg_start3 = Literal::u64_unsuffixed(chunk_offset + dim_offset);
+                quote! {
+                    if (#(_start >= #reg_start &&)* _start < #reg_end)
+                        || (#(_end > #reg_start2 &&)* _end <= #reg_end) {
+                        assert!(
+                            _start <= #reg_start3 && _end >= #reg_end,
+                            #part_no_impl,
+                            _start, _end,
+                        );
                         #call
+                    }
                 }
             }
         })
