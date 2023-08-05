@@ -76,50 +76,26 @@ pub fn read_write_field(
         output
     };
     let dim = (dim > 1).then(|| quote! {_dim: usize});
-    if let FieldData::Single(bits) = data {
-        let value_type = DataType::from_bits(bits);
-        if let Some(read) = read {
-            let todo_msg = todo_msg(true);
-            tokens.extend(quote! {
-                #[doc = #doc]
-                #[inline]
-                pub fn #read(&self, #dim) -> MemResult<#value_type> {
-                    todo!(#todo_msg)
-                }
-            })
-        }
-        if let Some(write) = write.as_ref() {
-            let dim = dim.into_iter();
-            let todo_msg = todo_msg(false);
-            tokens.extend(quote! {
-                #[doc = #doc]
-                #[inline]
-                pub fn #write(&mut self, #(#dim,)* _value: #value_type) -> MemResult<()> {
-                    todo!(#todo_msg)
-            }})
-        }
-    } else {
-        let value_type = DataType::from_bytes(data.bytes());
-        if let Some(read) = read.as_ref() {
-            let todo_msg = todo_msg(true);
-            tokens.extend(quote! {
-                #[doc = #doc]
-                #[inline]
-                pub fn #read(&self, #dim) -> MemResult<#value_type> {
-                    todo!(#todo_msg)
-                }
-            });
-        }
-        if let Some(write) = write.as_ref() {
-            let dim = dim.into_iter();
-            let todo_msg = todo_msg(false);
-            tokens.extend(quote! {
-                #[doc = #doc]
-                #[inline]
-                pub fn #write(&mut self, #(#dim,)* _value: #value_type) -> MemResult<()> {
-                    todo!(#todo_msg)
-                }
-            });
-        }
+    let value_type = DataType::from_bits(data.bits());
+    if let Some(read) = read.as_ref() {
+        let todo_msg = todo_msg(true);
+        tokens.extend(quote! {
+            #[doc = #doc]
+            #[inline]
+            pub fn #read(&self, #dim) -> MemResult<#value_type> {
+                todo!(#todo_msg)
+            }
+        });
+    }
+    if let Some(write) = write.as_ref() {
+        let dim = dim.into_iter();
+        let todo_msg = todo_msg(false);
+        tokens.extend(quote! {
+            #[doc = #doc]
+            #[inline]
+            pub fn #write(&mut self, #(#dim,)* _value: #value_type) -> MemResult<()> {
+                todo!(#todo_msg)
+            }
+        });
     }
 }

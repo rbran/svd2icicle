@@ -138,94 +138,101 @@ impl MemoryPage {
 
     fn call_register_from_chunk<'b>(
         &'b self,
-        base_addr: u64,
+        reg_addr: u64,
         reg: &'b RegisterAccess,
         read: bool,
     ) -> impl Iterator<Item = TokenStream> + 'b {
         (0..reg.dim).map(move |dim_i| {
-            let chunk_offset = base_addr - self.addr;
+            let chunk_offset = reg_addr - self.addr;
             let dim_offset = dim_i as u64 * reg.bytes as u64;
             let reg_start = chunk_offset + dim_offset;
             let reg_end = reg_start + reg.bytes as u64;
-            let range = reg_start..reg_end;
             let value = format_ident!("_value");
-            let value_type = helper::DataType::from_bytes(reg.bytes);
-            let reg_start = (range.start > 0).then_some(Literal::u64_unsuffixed(range.start)).into_iter();
-            let reg_start2 = reg_start.clone();
-            let reg_end = Literal::u64_unsuffixed(range.end);
             let dim = (reg.dim > 1).then(|| Literal::u32_unsuffixed(dim_i));
+
+            let range_start = Literal::u64_unsuffixed(reg_start);
+            let range_end = Literal::u64_unsuffixed(reg_end);
+            let in_range = quote! {
+                _start < #range_end && _end > #range_start
+            };
             if read {
-                let bytes = range.enumerate().map(|(byte_i, byte)| {
-                    let byte = Literal::u64_unsuffixed(byte);
-                    let byte_i = Literal::usize_unsuffixed(byte_i);
+                let call = if let Some(read) = reg.read_fun.as_ref() {
+                    // if single field, use the peripheral call directly,
+                    // otherwise call the register implementation from the pages
+                    // struct
+                    let fun = if reg.is_single_field() {
+                        quote!{ self.0.lock().unwrap().#read }
+                    } else {
+                        quote! { self.#read }
+                    };
+                    let bytes = (reg_start..reg_end).enumerate().map(|(byte_i, byte)| {
+                        let byte = Literal::u64_unsuffixed(byte);
+                        let byte_i = Literal::usize_unsuffixed(byte_i);
+                        quote!{
+                            if _start <= #byte && _end > #byte {
+                                _buf[(#byte - _start) as usize] =
+                                    #value[#byte_i];
+                            }
+                        }
+                    });
                     // TODO implement byte endian here
                     quote!{
-                        if _start <= #byte && _end > #byte {
-                            _buf[(#byte - _start) as usize] = ((#value >> #byte_i) & 0xff) as u8;
-                        }
+                        let #value = #fun(#dim)?.to_ne_bytes();
+                        #(#bytes)*
                     }
-                });
-                let call = reg
-                    .gen_mem_page_function_call(dim, None)
-                    .map(|call| {
-                        quote!{
-                            let #value = #call;
-                            #(#bytes)*
-                        }
-                    })
-                    .unwrap_or_else(||
-                        quote! {
-                            return Err(MemError::ReadViolation);
-                        }
-                    );
+                } else {
+                    quote! { return Err(MemError::ReadViolation); }
+                };
                 quote! {
-                    if (#(_start >= #reg_start &&)* _start < #reg_end)
-                        || (#(_end > #reg_start2 &&)* _end <= #reg_end) {
-                            #call
-                    }
+                    if #in_range { #call }
                 }
-            }else {
-                let bytes = range.enumerate().map(|(byte_i, byte)| {
-                    let byte = Literal::u64_unsuffixed(byte);
-                    let byte_i = Literal::usize_unsuffixed(byte_i);
-                    // TODO implement byte endian here
-                    // TODO allow partial writes to registers?
-                    // TODO pass the &mut u32 directly if data allign?
-                    quote!{
-                        #value |= (_buf[(#byte - _start) as usize] << #byte_i) as #value_type;
-                    }
-                });
-                let call = reg
-                    .gen_mem_page_function_call(dim, Some(&value))
-                    .map(|call| {
-                        quote!{
-                            let mut #value = 0;
-                            #(#bytes)*
-                            #call;
-                        }
-                    })
-                    .unwrap_or_else(||
-                        quote! {
-                            return Err(MemError::WriteViolation);
-                        }
-                    );
-                // TODO allow partial writes to registers?
-                // TODO pass the &mut u32 directly if data allign?
-                let part_no_impl = format!(
-                    "partial write ({{}}:{{}}) for {} {} not implemented",
-                    &reg.regs[0].0.name,
-                    &reg.regs[0].1.name,
-                );
-                let reg_start3 = Literal::u64_unsuffixed(chunk_offset + dim_offset);
-                quote! {
-                    if (#(_start >= #reg_start &&)* _start < #reg_end)
-                        || (#(_end > #reg_start2 &&)* _end <= #reg_end) {
-                        assert!(
-                            _start <= #reg_start3 && _end >= #reg_end,
-                            #part_no_impl,
-                            _start, _end,
+            } else {
+                if let Some(write) = reg.write_fun.as_ref() {
+                    let reg_bytes = Literal::u32_unsuffixed(reg.bytes);
+                    // if single field, use the peripheral call directly,
+                    // otherwise call the register implementation from the pages
+                    // struct
+                    if reg.is_single_field() {
+                        let part_no_impl = format!(
+                            "partial write for {} {} not implemented",
+                            &reg.regs[0].0.name,
+                            &reg.regs[0].1.name,
                         );
-                        #call
+                        let value_type = helper::DataType::from_bytes(reg.bytes);
+                        let dim = dim.into_iter();
+                        // TODO implement byte endian here
+                        quote! {
+                            if #in_range {
+                                assert!(
+                                    _start <= #reg_start && _end >= #reg_end,
+                                    #part_no_impl,
+                                );
+                                let start = _start.saturating_sub(#reg_start) as usize;
+                                let end = (_end.saturating_sub(#reg_start) as usize)
+                                    .min(start + #reg_bytes);
+                                self.0.lock().unwrap().#write(
+                                    #(#dim,)*
+                                    #value_type::from_ne_bytes(
+                                        _buf[start..end].try_into().unwrap()
+                                    )
+                                )?;
+                            }
+                        }
+                    } else {
+                        let dim = dim.into_iter();
+                        quote! {
+                            if #in_range {
+                                let offset = #reg_start.saturating_sub(_start);
+                                let start = _start.saturating_sub(#reg_start) as usize;
+                                let end = (_end.saturating_sub(#reg_start) as usize)
+                                    .min(start + #reg_bytes);
+                                self.#write(#(#dim,)* offset, &_buf[start..end])?;
+                            }
+                        }
+                    }
+                } else {
+                    quote! {
+                        if #in_range { return Err(MemError::ReadViolation); }
                     }
                 }
             }

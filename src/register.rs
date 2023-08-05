@@ -172,7 +172,7 @@ impl<'a> RegisterAccess<'a> {
     }
 
     /// true if is compose of a single field with the same len then the register
-    fn is_single_field(&self) -> bool {
+    pub fn is_single_field(&self) -> bool {
         // if no fields, means it is a single implicit field
         if self.fields.is_empty() {
             return true;
@@ -282,62 +282,112 @@ impl<'a> RegisterAccess<'a> {
             }
             if let Some(write) = self.write_fun.as_ref() {
                 let fields = self.fields.iter().map(|field| {
-                    let lsb = field.fields[0].2.lsb();
-                    let bits = field.fields[0].2.bit_width();
+                    let field_start = field.fields[0].2.lsb() / 8;
+                    let field_bytes = field.data.bytes();
+                    let field_lsb = Literal::u32_unsuffixed(field.fields[0].2.lsb() % 8);
+                    let field_end = Literal::u32_unsuffixed(field_start + field_bytes);
+                    let field_start = Literal::u32_unsuffixed(field_start);
+
                     let write = field.write.as_ref().unwrap();
-                    if bits == 1 {
-                        quote! {
-                            self.0.lock().unwrap().#write(
-                                #dim_use ((_value >> #lsb) & 1) != 0
-                            )?;
+
+                    match field.data {
+                        FieldData::Single(bits) => {
+                            let mask = if bits == 1 {
+                                quote!{ 1 != 0 }
+                            } else {
+                                (u8::MAX >> (u8::BITS - bits)).to_token_stream()
+                            };
+                            quote! {
+                                // TODO implement byte endian here
+                                if (_start.._end).contains(&#field_start) {
+                                    let _i = (_start - #field_start) as usize;
+                                    self.0.lock().unwrap().#write(
+                                        #dim_use
+                                        (_value[_i] >> #field_lsb) & #mask,
+                                    )?;
+                                }
+                            }
                         }
-                    } else {
-                        let mask = Literal::u128_unsuffixed(
-                            u128::MAX
-                                >> (u128::BITS
-                                    - field.fields[0].2.bit_width()),
-                        );
-                        quote! {
-                            self.0.lock().unwrap().#write(
-                                #dim_use ((_value >> #lsb) & #mask).try_into().unwrap()
-                            )?;
+                        FieldData::Multiple { first: 0, bytes, last: 0 } => {
+                            let value_type = helper::DataType::from_bytes(bytes);
+                            let bytes = Literal::u32_unsuffixed(bytes);
+                            // TODO implement byte endian here
+                            quote! {
+                                if _start <= #field_start && _end >= #field_end {
+                                    let _offset_start = (#field_start - _start) as usize;
+                                    let _offset_end = _offset_start + #bytes;
+                                    let _value = #value_type::from_ne_bytes(
+                                        _value[_offset_start.._offset_end]
+                                        .try_into().unwrap()
+                                    );
+                                    self.0.lock().unwrap().#write(#dim_use _value)?;
+                                } else if (_start > #field_start && _start < #field_end)
+                                    || (_end > #field_start && _end < #field_end) {
+                                    return Err(MemError::WriteViolation);
+                                }
+                            }
+                        }
+                        FieldData::Multiple { first, bytes, last } => {
+                            let value_type = helper::DataType::from_bytes(field_bytes);
+                            let first_byte = (first > 0).then(|| {
+                                let first_mask = u8::MAX >> (u8::BITS - first);
+                                quote!{
+                                    _extracted |= ((_value[(#field_start - _start) as usize] >> #field_lsb)
+                                        & #first_mask) as #value_type;
+                                }
+                            });
+                            let middle_bytes = (bytes > 0).then(|| {
+                                let bytes = Literal::u32_unsuffixed(bytes);
+                                quote!{
+                                    for byte_i in 0..#bytes {
+                                        _extracted |= (_value[
+                                            ((#field_start + byte_i + 1) - _start) as usize
+                                        ] as #value_type) << (#field_lsb + (byte_i * 8));
+                                    }
+                                }
+                            });
+                            let last_byte = (last > 0).then(|| {
+                                let last_mask = u8::MAX >> (u8::BITS - last);
+                                let bytes = Literal::u32_unsuffixed(bytes);
+                                quote! {
+                                    _extracted |= ((_value[
+                                        ((#field_start + #bytes + 1) - _start) as usize
+                                    ] & #last_mask) as #value_type) << (#field_lsb + (#bytes * 8));
+                                }
+                            });
+                            // TODO implement byte endian here
+                            quote! {
+                                if _start <= #field_start && _end >= #field_end {
+                                    let mut _extracted: #value_type = 0;
+                                    #first_byte
+                                    #middle_bytes
+                                    #last_byte
+                                    self.0.lock().unwrap().#write(#dim_use _extracted)?;
+                                } else if (_start > #field_start && _start < #field_end)
+                                    || (_end > #field_start && _end < #field_end) {
+                                    return Err(MemError::WriteViolation);
+                                }
+                            }
                         }
                     }
+
                 });
+                // TODO implement byte endian here
                 tokens.extend(quote! {
                     // NOTE no comma on dim_declare
                     fn #write(
                         &mut self,
                         #dim_declare
-                        _value: #value_type,
+                        _start: u64,
+                        _value: &[u8],
                     ) -> MemResult<()> {
+                        debug_assert!(!_value.is_empty());
+                        let _end = _start + _value.len() as u64;
                         #(#fields)*
                         Ok(())
                     }
                 });
             }
-        }
-    }
-
-    pub fn gen_mem_page_function_call(
-        &self,
-        dim: Option<Literal>,
-        param: Option<&Ident>,
-    ) -> Option<TokenStream> {
-        let fun = if param.is_some() {
-            self.write_fun.as_ref()?
-        } else {
-            self.read_fun.as_ref()?
-        };
-        // if single field, use the peripheral call directly, otherwise
-        // call the register implementation from the pages struct
-        let dim = dim.into_iter();
-        if self.is_single_field() {
-            Some(quote! {
-                self.0.lock().unwrap().#fun(#(#dim,)* #param)?
-            })
-        } else {
-            Some(quote! { self.#fun(#(#dim,)* #param)? })
         }
     }
 
