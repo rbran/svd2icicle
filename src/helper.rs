@@ -82,7 +82,7 @@ pub fn read_write_field(
         tokens.extend(quote! {
             #[doc = #doc]
             #[inline]
-            pub fn #read(&self, #dim) -> MemResult<#value_type> {
+            pub(crate) fn #read(&self, #dim) -> MemResult<#value_type> {
                 todo!(#todo_msg)
             }
         });
@@ -93,7 +93,7 @@ pub fn read_write_field(
         tokens.extend(quote! {
             #[doc = #doc]
             #[inline]
-            pub fn #write(&mut self, #(#dim,)* _value: #value_type) -> MemResult<()> {
+            pub(crate) fn #write(&mut self, #(#dim,)* _value: #value_type) -> MemResult<()> {
                 todo!(#todo_msg)
             }
         });

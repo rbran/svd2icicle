@@ -47,7 +47,7 @@ impl MemoryPage {
             });
         let page_offset = Literal::u64_unsuffixed(self.addr);
         tokens.extend(quote! {
-            pub struct #pseudo_struct(
+            pub(crate) struct #pseudo_struct(
                 pub std::sync::Arc<std::sync::Mutex<super::peripheral::Peripherals>>
             );
             impl icicle_vm::cpu::mem::IoMemory for #pseudo_struct {

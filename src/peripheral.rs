@@ -38,6 +38,16 @@ impl<'a> Peripherals<'a> {
                         .and_modify(|regs| regs.push((per, reg)))
                         .or_insert_with(|| vec![(per, reg)]);
                 }
+                for clu in per.clusters() {
+                    let addr = per.base_address + clu.address_offset as u64;
+                    for reg in clu.registers() {
+                        let addr = addr + reg.address_offset as u64;
+                        registers
+                            .entry(addr)
+                            .and_modify(|regs| regs.push((per, reg)))
+                            .or_insert_with(|| vec![(per, reg)]);
+                    }
+                }
             }
         }
         let registers = registers
