@@ -1,6 +1,5 @@
 use std::ops::Range;
 
-use indexmap::IndexMap;
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 
@@ -11,7 +10,7 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryPage {
     pub pseudo_struct: Ident,
-    pub addr: u64,
+    pub page_offset: u64,
     pub chunks: Vec<MemoryChunk>,
 }
 
@@ -35,17 +34,33 @@ impl MemoryPage {
         tokens: &mut TokenStream,
     ) {
         let pseudo_struct = &self.pseudo_struct;
-        let (read, write): (TokenStream, TokenStream) = self
+        let register_functions = peripherals
+            .registers
+            .iter()
+            .filter(|reg| reg.base_addr & PAGE_MASK == self.page_offset)
+            .map(|reg| reg.mem_map_functions());
+
+        struct ChunkCall<'a, 'b>(
+            &'a MemoryPage,
+            &'a Peripherals<'b>,
+            &'a MemoryChunk,
+            bool,
+        );
+        impl ToTokens for ChunkCall<'_, '_> {
+            fn to_tokens(&self, tokens: &mut TokenStream) {
+                self.0.gen_chunk_read_write(self.1, self.2, self.3, tokens)
+            }
+        }
+        let read = self
             .chunks
             .iter()
-            .map(|chunk| self.gen_chunk_read_write(peripherals, chunk))
-            .unzip();
-        let register_functions =
-            peripherals.registers.iter().filter_map(|(addr, reg)| {
-                (*addr & PAGE_MASK == self.addr)
-                    .then(|| reg.mem_map_functions())
-            });
-        let page_offset = Literal::u64_unsuffixed(self.addr);
+            .map(|chunk| ChunkCall(self, peripherals, chunk, true));
+        let write = self
+            .chunks
+            .iter()
+            .map(|chunk| ChunkCall(self, peripherals, chunk, false));
+
+        let page_offset = Literal::u64_unsuffixed(self.page_offset);
         tokens.extend(quote! {
             pub(crate) struct #pseudo_struct(
                 pub std::sync::Arc<std::sync::Mutex<super::peripheral::Peripherals>>
@@ -59,7 +74,7 @@ impl MemoryPage {
                     let _start = _addr - #page_offset;
                     let _end = _start + u64::try_from(_buf.len()).unwrap();
                     match (_start, _end) {
-                        #read
+                        #(#read)*
                         _ => return Err(MemError::Unmapped),
                     }
                 }
@@ -71,7 +86,7 @@ impl MemoryPage {
                     let _start = _addr - #page_offset;
                     let _end = _start + u64::try_from(_buf.len()).unwrap();
                     match (_start, _end) {
-                        #write
+                        #(#write)*
                         _ => return Err(MemError::Unmapped),
                     }
                 }
@@ -86,79 +101,83 @@ impl MemoryPage {
         &self,
         peripherals: &Peripherals,
         chunk: &MemoryChunk,
-    ) -> (TokenStream, TokenStream) {
-        let page_offset = self.addr;
+        read: bool,
+        tokens: &mut TokenStream,
+    ) {
+        let page_offset = self.page_offset;
         let start = chunk.0.start - page_offset;
         let end = chunk.0.end - page_offset;
-        let registers_in_chunk = peripherals
-            .registers
-            .iter()
-            .filter(|(addr, _reg)| chunk.0.contains(*addr));
         // NOTE is very common to have a entier block read/write only, so
         // if this is the case return an error for the block.
         let startp1 = Literal::u64_unsuffixed(start + 1);
         let start = (start != 0).then_some(Literal::u64_unsuffixed(start));
         let endm1 = Literal::u64_unsuffixed(end - 1);
         let end = Literal::u64_unsuffixed(end);
-        let read = if registers_in_chunk
-            .clone()
-            .all(|(_addr, reg)| reg.read_fun.is_none())
-        {
-            quote! { (#start..=#endm1, #startp1..=#end) => return Err(MemError::ReadViolation), }
-        } else {
-            let registers_read =
-                registers_in_chunk.clone().flat_map(|(addr, reg)| {
-                    self.call_register_from_chunk(chunk, *addr, reg, true)
-                });
-            quote! {
-                (#start..=#endm1, #startp1..=#end) => {
-                    #(#registers_read)*
-                    Ok(())
-                },
-            }
-        };
-        let write = if registers_in_chunk
-            .clone()
-            .all(|(_addr, reg)| reg.write_fun.is_none())
-        {
-            quote! { (#start..=#endm1, #startp1..=#end) => return Err(MemError::WriteViolation), }
-        } else {
-            let registers_write = registers_in_chunk.flat_map(|(addr, reg)| {
-                self.call_register_from_chunk(chunk, *addr, reg, false)
+        let not_available_block = peripherals
+            .registers
+            .iter()
+            .filter(|reg| reg.base_addr & PAGE_MASK == self.page_offset)
+            .all(|reg| {
+                if read {
+                    reg.read_fun.is_none()
+                } else {
+                    reg.write_fun.is_none()
+                }
             });
-            quote! {
+        if not_available_block {
+            if read {
+                tokens.extend(quote! {
+                    (#start..=#endm1, #startp1..=#end) => return Err(MemError::ReadViolation),
+                });
+            } else {
+                tokens.extend(quote! {
+                    (#start..=#endm1, #startp1..=#end) => return Err(MemError::WriteViolation),
+                });
+            }
+        } else {
+            let registers_write = peripherals
+                .registers
+                .iter()
+                .filter(|reg| reg.base_addr & PAGE_MASK == self.page_offset)
+                .flat_map(|reg| {
+                    self.call_register_from_chunk(chunk, reg, read)
+                });
+            tokens.extend(quote! {
                 (#start..=#endm1, #startp1..=#end) => {
                     #(#registers_write)*
                     Ok(())
                 },
-            }
-        };
-        (read, write)
+            });
+        }
     }
 
     fn call_register_from_chunk<'b>(
         &'b self,
         chunk: &'b MemoryChunk,
-        reg_addr: u64,
         reg: &'b RegisterAccess,
         read: bool,
     ) -> impl Iterator<Item = TokenStream> + 'b {
-        (0..reg.dim.0).map(move |dim_i| {
-            let chunk_offset = reg_addr - self.addr;
-            let dim_offset = (dim_i as u64 * reg.dim.1 as u64) * reg.bytes as u64;
-            let reg_start = chunk_offset + dim_offset;
-            // if not in this chunk, do nothing
-            if chunk.0.contains(&dim_offset) {
+        reg.dim_iter().enumerate().map(move |(dim_i, reg_addr)| {
+            // if not in this page or chunk, do nothing
+            if !chunk.0.contains(&reg_addr) {
                 return quote!{};
             }
-            let reg_end = reg_start + reg.bytes as u64;
             let value = format_ident!("_value");
-            let dim = (reg.dim.0 > 1).then(|| Literal::u32_unsuffixed(dim_i));
+            let dim = reg.is_dim().then(|| Literal::usize_unsuffixed(dim_i));
 
-            let range_start = Literal::u64_unsuffixed(reg_start);
-            let range_end = Literal::u64_unsuffixed(reg_end);
+            let offset_start = reg_addr - chunk.0.start;
+            let offset_end = offset_start + reg.bytes as u64;
+
+            let offset_start_lit = Literal::u64_unsuffixed(offset_start);
+            let offset_end_lit = Literal::u64_unsuffixed(offset_end);
+
+            // just to avoid the warning "comparison is useless due to type limits"
+            // for `var_uint < 0`
+            let in_range_start = (offset_start > 0).then(|| {
+                quote!{_start < #offset_start_lit }
+            }).into_iter();
             let in_range = quote! {
-                _start < #range_end && _end > #range_start
+                #(#in_range_start &&)* _end > #offset_end_lit
             };
             if read {
                 let call = if let Some(read) = reg.read_fun.as_ref() {
@@ -170,7 +189,7 @@ impl MemoryPage {
                     } else {
                         quote! { self.#read }
                     };
-                    let bytes = (reg_start..reg_end).enumerate().map(|(byte_i, byte)| {
+                    let bytes = (offset_start..offset_end).enumerate().map(|(byte_i, byte)| {
                         let byte = Literal::u64_unsuffixed(byte);
                         let byte_i = Literal::usize_unsuffixed(byte_i);
                         quote!{
@@ -209,11 +228,11 @@ impl MemoryPage {
                         quote! {
                             if #in_range {
                                 assert!(
-                                    _start <= #reg_start && _end >= #reg_end,
+                                    _start <= #offset_start_lit && _end >= #offset_end,
                                     #part_no_impl,
                                 );
-                                let start = _start.saturating_sub(#reg_start) as usize;
-                                let end = (_end.saturating_sub(#reg_start) as usize)
+                                let start = _start.saturating_sub(#offset_start_lit) as usize;
+                                let end = (_end.saturating_sub(#offset_start_lit) as usize)
                                     .min(start + #reg_bytes);
                                 self.0.lock().unwrap().#write(
                                     #(#dim,)*
@@ -227,9 +246,9 @@ impl MemoryPage {
                         let dim = dim.into_iter();
                         quote! {
                             if #in_range {
-                                let offset = #reg_start.saturating_sub(_start);
-                                let start = _start.saturating_sub(#reg_start) as usize;
-                                let end = (_end.saturating_sub(#reg_start) as usize)
+                                let offset = #offset_start.saturating_sub(_start);
+                                let start = _start.saturating_sub(#offset_start_lit) as usize;
+                                let end = (_end.saturating_sub(#offset_start_lit) as usize)
                                     .min(start + #reg_bytes);
                                 self.#write(#(#dim,)* offset, &_buf[start..end])?;
                             }
@@ -252,14 +271,13 @@ pub struct MemoryChunk(pub Range<u64>);
 /// TODO check that each page is aligned
 pub fn pages_from_chunks(
     addr_bits: u32,
-    registers: &IndexMap<u64, RegisterAccess>,
+    registers: &[RegisterAccess],
 ) -> Vec<MemoryPage> {
     let page_mask = (u64::MAX >> addr_bits) << addr_bits;
     let mut chunks = Vec::new();
-    for (addr, regs) in registers.iter() {
-        let reg_offset = *addr as u64;
-        for dim_i in 0..regs.dim.0 {
-            let start = reg_offset + (dim_i as u64 * regs.dim.1 as u64);
+    for regs in registers.iter() {
+        for reg_addr in regs.dim_iter() {
+            let start = reg_addr;
             let end = start + regs.bytes as u64;
             assert_eq!(
                 start & page_mask,
@@ -283,7 +301,7 @@ pub fn pages_from_chunks(
         let chunk_page = chunk.0.start & page_mask;
         match pages.last_mut() {
             // if it belongs to the same page, add this chunk to the last page
-            Some(last) if last.addr == chunk_page => {
+            Some(last) if last.page_offset == chunk_page => {
                 // merge the chunks if they are intersecting/sequential
                 match last.chunks.last_mut() {
                     Some(last) if last.0.end >= chunk.0.start => {
@@ -298,7 +316,7 @@ pub fn pages_from_chunks(
                     "PeripheralPage0x{:X}",
                     chunk_page
                 ),
-                addr: chunk_page,
+                page_offset: chunk_page,
                 chunks: vec![chunk],
             }),
         }

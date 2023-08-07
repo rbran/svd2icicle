@@ -7,7 +7,6 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.71"
-indexmap = "2.0.0"
 proc-macro2 = "1.0.63"
 quote = "1.0.28"
 svd-parser = "0.14.1"

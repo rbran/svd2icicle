@@ -1,5 +1,6 @@
+use std::collections::HashMap;
+
 use anyhow::{anyhow, bail, Result};
-use indexmap::IndexMap;
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::{MaybeArray, Name, Peripheral, Register};
@@ -12,7 +13,8 @@ use crate::helper;
 pub struct RegisterAccess<'a> {
     pub read_fun: Option<Ident>,
     pub write_fun: Option<Ident>,
-    pub dim: (u32, u32),
+    pub base_addr: u64,
+    dim: (u32, u32),
     pub bytes: u32,
     pub regs: Vec<(&'a Peripheral, &'a Register, Option<(u32, u32)>)>,
     pub fields: Vec<FieldAccess<'a>>,
@@ -24,6 +26,7 @@ pub struct RegisterAccess<'a> {
 
 impl<'a> RegisterAccess<'a> {
     pub fn new(
+        base_addr: u64,
         regs: Vec<(&'a Peripheral, &'a Register, Option<(u32, u32)>)>,
     ) -> Result<Self> {
         // all register names, used for error messages
@@ -130,7 +133,7 @@ impl<'a> RegisterAccess<'a> {
         }
         let bytes = bits / 8;
 
-        let mut fields: IndexMap<u32, Vec<_>> = IndexMap::new();
+        let mut fields: HashMap<u32, Vec<_>> = HashMap::new();
         for (per, reg, field) in regs.iter().flat_map(|(per, reg, _)| {
             reg.fields().map(move |field| (*per, *reg, field))
         }) {
@@ -166,13 +169,14 @@ impl<'a> RegisterAccess<'a> {
         );
 
         // TODO check if the fields overlap or goes outside the register
-        let fields = fields
+        let mut fields: Vec<_> = fields
             .into_iter()
-            .map(|(_offset, fields)| {
+            .map(|(offset, fields)| {
                 // TODO compare field access with register access
                 FieldAccess::new(
                     fields,
-                    (dim_num, dim_inc),
+                    offset,
+                    dim_num > 1,
                     &per_name,
                     &name,
                     access,
@@ -181,8 +185,10 @@ impl<'a> RegisterAccess<'a> {
                 )
             })
             .collect::<Result<_, _>>()?;
+        fields.sort_by_key(|f| f.offset);
 
         Ok(Self {
+            base_addr,
             dim: (dim_num, dim_inc),
             bytes,
             read_fun,
@@ -192,6 +198,19 @@ impl<'a> RegisterAccess<'a> {
             clean_value,
             reset_value,
             reset_mask,
+        })
+    }
+
+    pub fn is_dim(&self) -> bool {
+        self.dim.0 > 1
+    }
+
+    pub fn dim_iter<'b>(&'b self) -> impl Iterator<Item = u64> + 'b {
+        let mut acc = self.base_addr;
+        (0..self.dim.0).map(move |_i| {
+            let next = acc;
+            acc += self.dim.1 as u64;
+            next
         })
     }
 
@@ -234,8 +253,8 @@ impl<'a> RegisterAccess<'a> {
         if self.is_single_field() {
             return;
         }
-        let dim_declare = (self.dim.0 > 1).then(|| quote! {_dim: usize,});
-        let dim_use = (self.dim.0 > 1).then(|| quote! {_dim,});
+        let dim_declare = self.is_dim().then(|| quote! {_dim: usize,});
+        let dim_use = self.is_dim().then(|| quote! {_dim,});
         let clean_value = Literal::u64_unsuffixed(self.clean_value);
         let value_type = helper::DataType::from_bytes(self.bytes);
         if self.bytes == 1 {
@@ -438,7 +457,7 @@ impl<'a> RegisterAccess<'a> {
                 .collect();
             let name = name.join(", ");
             helper::read_write_field(
-                self.dim,
+                self.dim.0 > 1,
                 &name,
                 self.read_fun.as_ref(),
                 self.write_fun.as_ref(),

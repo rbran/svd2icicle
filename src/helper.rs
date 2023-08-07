@@ -46,7 +46,7 @@ impl ToTokens for DataType {
 }
 
 pub fn read_write_field(
-    dim: (u32, u32),
+    dim: bool,
     name: &str,
     read: Option<&Ident>,
     write: Option<&Ident>,
@@ -75,7 +75,7 @@ pub fn read_write_field(
         }
         output
     };
-    let dim = (dim.0 > 1).then(|| quote! {_dim: usize});
+    let dim = dim.then(|| quote! {_dim: usize});
     let value_type = DataType::from_bits(data.bits());
     if let Some(read) = read.as_ref() {
         let todo_msg = todo_msg(true);

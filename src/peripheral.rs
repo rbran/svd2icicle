@@ -1,5 +1,6 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
-use indexmap::IndexMap;
 use proc_macro2::Literal;
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -12,13 +13,13 @@ use crate::{memory::MemoryPage, ADDR_BITS};
 
 pub struct Peripherals<'a> {
     pub memory: Vec<MemoryPage>,
-    pub registers: IndexMap<u64, RegisterAccess<'a>>,
+    pub registers: Vec<RegisterAccess<'a>>,
     pub svds: &'a [Device],
 }
 
 impl<'a> Peripherals<'a> {
     pub fn new(svds: &'a [Device]) -> Result<Self> {
-        let mut registers: IndexMap<u64, Vec<_>> = IndexMap::new();
+        let mut registers: HashMap<u64, Vec<_>> = HashMap::new();
         for svd in svds {
             for per in svd.peripherals.iter() {
                 // only allow derived if there is no registers, and vise-versa
@@ -62,12 +63,25 @@ impl<'a> Peripherals<'a> {
                 }
             }
         }
-        let registers = registers
+        let mut registers: Vec<_> = registers
             .into_iter()
             .map(|(addr, regs)| -> Result<_> {
-                Ok((addr, RegisterAccess::new(regs)?))
+                RegisterAccess::new(addr, regs)
             })
             .collect::<Result<_, _>>()?;
+        // sort register by addr so the code output is always in the same order
+        registers.sort_by_key(|reg| reg.base_addr);
+
+        //TODO allow registers between pages???????????????
+        if registers.iter().any(|reg| {
+            let mut reg_addrs = reg.dim_iter();
+            let first = reg_addrs.next().unwrap();
+            let last = reg_addrs.last().unwrap_or(first);
+            first & crate::PAGE_MASK != last & crate::PAGE_MASK
+        }) {
+            todo!("Allow register cluster between pages?");
+        }
+
         let memory = memory::pages_from_chunks(ADDR_BITS, &registers);
         Ok(Self {
             memory,
@@ -79,7 +93,7 @@ impl<'a> Peripherals<'a> {
     fn gen_map_pages(&self, tokens: &mut TokenStream) {
         // memory pages mapping to the cpu
         let memory_cpu_map = self.memory.iter().map(|page| {
-            let addr_start = Literal::u64_unsuffixed(page.addr);
+            let addr_start = Literal::u64_unsuffixed(page.page_offset);
             let pseudo_struct = &page.pseudo_struct;
             quote!{
                 let io = _cpu.mem.register_io_handler(pages::#pseudo_struct(std::sync::Arc::clone(_pe)));
@@ -95,8 +109,7 @@ impl<'a> Peripherals<'a> {
 
     fn gen_peripheral(&self, tokens: &mut TokenStream) {
         // the register/fields read/write functions
-        let regs_funs =
-            self.registers.values().map(|reg| reg.fields_functions());
+        let regs_funs = self.registers.iter().map(|reg| reg.fields_functions());
         // all the memory blocks
         tokens.extend(quote! {
             pub mod peripheral {

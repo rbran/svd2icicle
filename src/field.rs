@@ -45,7 +45,8 @@ impl FieldData {
 
 #[derive(Debug)]
 pub struct FieldAccess<'a> {
-    pub dim: (u32, u32),
+    pub offset: u32,
+    pub is_dim: bool,
     pub read: Option<Ident>,
     pub write: Option<Ident>,
     pub data: FieldData,
@@ -57,7 +58,8 @@ pub struct FieldAccess<'a> {
 impl<'a> FieldAccess<'a> {
     pub fn new(
         fields: Vec<(&'a Peripheral, &'a Register, &'a Field)>,
-        dim: (u32, u32),
+        offset: u32,
+        is_dim: bool,
         per_name: &str,
         reg_name: &str,
         default_access: Access,
@@ -113,7 +115,8 @@ impl<'a> FieldAccess<'a> {
         let reset_value = (reg_reset_value >> fields[0].2.lsb()) & bits;
         let reset_mask = (reg_reset_mask >> fields[0].2.lsb()) & bits;
         Ok(Self {
-            dim,
+            is_dim,
+            offset,
             read,
             write,
             data,
@@ -148,7 +151,7 @@ impl ToTokens for FieldAccess<'_> {
             .collect();
         let name = name.join(", ");
         helper::read_write_field(
-            self.dim,
+            self.is_dim,
             &name,
             self.read.as_ref(),
             self.write.as_ref(),
