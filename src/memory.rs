@@ -165,19 +165,14 @@ impl MemoryPage {
             let value = format_ident!("_value");
             let dim = reg.is_dim().then(|| Literal::usize_unsuffixed(dim_i));
 
-            let offset_start = reg_addr - chunk.0.start;
+            let offset_start = reg_addr - self.page_offset;
             let offset_end = offset_start + reg.bytes as u64;
 
             let offset_start_lit = Literal::u64_unsuffixed(offset_start);
             let offset_end_lit = Literal::u64_unsuffixed(offset_end);
 
-            // just to avoid the warning "comparison is useless due to type limits"
-            // for `var_uint < 0`
-            let in_range_start = (offset_start > 0).then(|| {
-                quote!{_start < #offset_start_lit }
-            }).into_iter();
             let in_range = quote! {
-                #(#in_range_start &&)* _end > #offset_end_lit
+                _start < #offset_end_lit && _end > #offset_start_lit
             };
             if read {
                 let call = if let Some(read) = reg.read_fun.as_ref() {
@@ -246,10 +241,9 @@ impl MemoryPage {
                         let dim = dim.into_iter();
                         quote! {
                             if #in_range {
-                                let offset = #offset_start.saturating_sub(_start);
-                                let start = _start.saturating_sub(#offset_start_lit) as usize;
-                                let end = (_end.saturating_sub(#offset_start_lit) as usize)
-                                    .min(start + #reg_bytes);
+                                let offset = _start.saturating_sub(#offset_start_lit);
+                                let start = #offset_start.saturating_sub(_start) as usize;
+                                let end = ((_end - #offset_start_lit) - offset) as usize;
                                 self.#write(#(#dim,)* offset, &_buf[start..end])?;
                             }
                         }

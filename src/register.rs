@@ -344,7 +344,7 @@ impl<'a> RegisterAccess<'a> {
                             quote! {
                                 // TODO implement byte endian here
                                 if (_start.._end).contains(&#field_start) {
-                                    let _i = (_start - #field_start) as usize;
+                                    let _i = (#field_start - _start) as usize;
                                     self.0.lock().unwrap().#write(
                                         #dim_use
                                         (_value[_i] >> #field_lsb) & #mask,
