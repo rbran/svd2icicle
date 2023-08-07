@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Result};
 use indexmap::IndexMap;
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
-use svd_parser::svd::{Name, Peripheral, Register};
+use svd_parser::svd::{MaybeArray, Name, Peripheral, Register};
 
 use crate::field::{FieldAccess, FieldData};
 use crate::formater::{self, dim_to_n, snake_case};
@@ -12,9 +12,9 @@ use crate::helper;
 pub struct RegisterAccess<'a> {
     pub read_fun: Option<Ident>,
     pub write_fun: Option<Ident>,
-    pub dim: u32,
+    pub dim: (u32, u32),
     pub bytes: u32,
-    pub regs: Vec<(&'a Peripheral, &'a Register)>,
+    pub regs: Vec<(&'a Peripheral, &'a Register, Option<(u32, u32)>)>,
     pub fields: Vec<FieldAccess<'a>>,
     /// reset value, except for the fields (0s there)
     pub clean_value: u64,
@@ -23,11 +23,13 @@ pub struct RegisterAccess<'a> {
 }
 
 impl<'a> RegisterAccess<'a> {
-    pub fn new(regs: Vec<(&'a Peripheral, &'a Register)>) -> Result<Self> {
+    pub fn new(
+        regs: Vec<(&'a Peripheral, &'a Register, Option<(u32, u32)>)>,
+    ) -> Result<Self> {
         // all register names, used for error messages
         let regs_names = || {
             regs.iter()
-                .map(|(per, reg)| format!("{}::{}", per.name(), reg.name()))
+                .map(|(per, reg, _)| format!("{}::{}", per.name(), reg.name()))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -36,7 +38,7 @@ impl<'a> RegisterAccess<'a> {
         let per_name: String = {
             let mut pers = std::collections::HashSet::new();
             regs.iter()
-                .filter_map(move |(per, _reg)| {
+                .filter_map(move |(per, _reg, _)| {
                     pers.insert(
                         (*per as *const svd_parser::svd::MaybeArray<_>)
                             as usize,
@@ -48,18 +50,40 @@ impl<'a> RegisterAccess<'a> {
         //TODO how to handle regs with multiple names?
         let name = snake_case(&dim_to_n(&regs[0].1.name));
 
-        // registers can have diferent dims, use the biggest one
-        let dim = regs
-            .iter()
-            .map(|(_per, reg)| match reg {
-                svd_parser::svd::MaybeArray::Single(_reg) => 1,
-                svd_parser::svd::MaybeArray::Array(_reg, dim) => dim.dim,
-            })
+        // registers can have diferent dims, use the biggest one, dim increment
+        // need to be the same size
+        let mut dim_iter =
+            regs.iter().filter_map(|(_per, reg, clu_dim)| {
+                match (reg, clu_dim) {
+                    (MaybeArray::Array(_reg, _dim), Some(_)) => {
+                        todo!(
+                            "registers {}::{} with dim inside a cluster",
+                            regs[0].0.name(),
+                            regs[0].1.name(),
+                        )
+                    }
+                    (MaybeArray::Array(_reg, dim), None) => {
+                        Some((dim.dim, dim.dim_increment))
+                    }
+                    (MaybeArray::Single(_), clu_dim) => *clu_dim,
+                }
+            });
+        let dim_num = dim_iter
+            .clone()
+            .map(|(dim_num, _)| dim_num)
             .max()
-            .unwrap();
+            .unwrap_or(1);
+        let (_, dim_inc) = dim_iter.next().unwrap_or((1, 0));
+        if dim_iter.any(|(_, this_dim_inc)| dim_inc != this_dim_inc) {
+            bail!(
+                "registers {}::{} with invalid dim_incr",
+                regs[0].0.name(),
+                regs[0].1.name(),
+            )
+        }
 
         // all register need to have the same access permissions
-        let mut access_iter = regs.iter().map(|(per, reg)| {
+        let mut access_iter = regs.iter().map(|(per, reg, _)| {
             reg.properties
                 .access
                 .or(per.default_register_properties.access)
@@ -84,7 +108,7 @@ impl<'a> RegisterAccess<'a> {
             .can_write()
             .then(|| format_ident!("write_{}_{}", &per_name, name));
 
-        let mut regs_sizes = regs.iter().map(|(per, reg)| {
+        let mut regs_sizes = regs.iter().map(|(per, reg, _)| {
             reg.properties.size.or(per.default_register_properties.size)
         });
         let bits = regs_sizes.next().unwrap().ok_or_else(|| {
@@ -107,7 +131,7 @@ impl<'a> RegisterAccess<'a> {
         let bytes = bits / 8;
 
         let mut fields: IndexMap<u32, Vec<_>> = IndexMap::new();
-        for (per, reg, field) in regs.iter().flat_map(|(per, reg)| {
+        for (per, reg, field) in regs.iter().flat_map(|(per, reg, _)| {
             reg.fields().map(move |field| (*per, *reg, field))
         }) {
             fields
@@ -117,7 +141,7 @@ impl<'a> RegisterAccess<'a> {
         }
 
         // all register need to have the same reset_value
-        let mut reset_value_mask_iter = regs.iter().map(|(_per, reg)| {
+        let mut reset_value_mask_iter = regs.iter().map(|(_per, reg, _)| {
             let value = reg.properties.reset_value.unwrap_or(0);
             let mask = reg.properties.reset_mask.unwrap_or(u64::MAX);
             (value, mask)
@@ -148,7 +172,7 @@ impl<'a> RegisterAccess<'a> {
                 // TODO compare field access with register access
                 FieldAccess::new(
                     fields,
-                    dim,
+                    (dim_num, dim_inc),
                     &per_name,
                     &name,
                     access,
@@ -159,7 +183,7 @@ impl<'a> RegisterAccess<'a> {
             .collect::<Result<_, _>>()?;
 
         Ok(Self {
-            dim,
+            dim: (dim_num, dim_inc),
             bytes,
             read_fun,
             write_fun,
@@ -210,8 +234,8 @@ impl<'a> RegisterAccess<'a> {
         if self.is_single_field() {
             return;
         }
-        let dim_declare = (self.dim > 1).then(|| quote! {_dim: usize,});
-        let dim_use = (self.dim > 1).then(|| quote! {_dim,});
+        let dim_declare = (self.dim.0 > 1).then(|| quote! {_dim: usize,});
+        let dim_use = (self.dim.0 > 1).then(|| quote! {_dim,});
         let clean_value = Literal::u64_unsuffixed(self.clean_value);
         let value_type = helper::DataType::from_bytes(self.bytes);
         if self.bytes == 1 {
@@ -240,7 +264,8 @@ impl<'a> RegisterAccess<'a> {
                     let lsb = field.fields[0].2.lsb();
                     let mask =
                         u8::MAX >> (u8::BITS - field.fields[0].2.bit_width());
-                    let dim = (self.dim > 1).then(|| quote! {_dim}).into_iter();
+                    let dim =
+                        (self.dim.0 > 1).then(|| quote! {_dim}).into_iter();
                     Some(quote! {
                         self.0.lock().unwrap().#field_fun(
                             #(#dim,)*
@@ -396,7 +421,7 @@ impl<'a> RegisterAccess<'a> {
             let docs: Vec<_> = self
                 .regs
                 .iter()
-                .filter_map(|(per, reg)| {
+                .filter_map(|(per, reg, _)| {
                     Some(format!(
                         "{} {}: {}",
                         per.name(),
@@ -409,7 +434,7 @@ impl<'a> RegisterAccess<'a> {
             let name: Vec<_> = self
                 .regs
                 .iter()
-                .map(|(per, reg)| format!("{} {}", per.name(), reg.name()))
+                .map(|(per, reg, _)| format!("{} {}", per.name(), reg.name()))
                 .collect();
             let name = name.join(", ");
             helper::read_write_field(

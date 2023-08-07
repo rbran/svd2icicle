@@ -4,6 +4,7 @@ use proc_macro2::Literal;
 use proc_macro2::TokenStream;
 use quote::quote;
 use svd_parser::svd::Device;
+use svd_parser::svd::MaybeArray;
 
 use crate::register::RegisterAccess;
 use crate::{memory, PAGE_LEN};
@@ -35,17 +36,28 @@ impl<'a> Peripherals<'a> {
                     let addr = per.base_address + reg.address_offset as u64;
                     registers
                         .entry(addr)
-                        .and_modify(|regs| regs.push((per, reg)))
-                        .or_insert_with(|| vec![(per, reg)]);
+                        .and_modify(|regs| regs.push((per, reg, None)))
+                        .or_insert_with(|| vec![(per, reg, None)]);
                 }
                 for clu in per.clusters() {
                     let addr = per.base_address + clu.address_offset as u64;
+                    if clu.clusters().count() != 0 {
+                        todo!("cluster inside other cluster");
+                    }
+                    let cluster_dim = match clu {
+                        MaybeArray::Array(_clu, dim) => {
+                            Some((dim.dim, dim.dim_increment))
+                        }
+                        _ => todo!("not arrau cluster"),
+                    };
                     for reg in clu.registers() {
                         let addr = addr + reg.address_offset as u64;
                         registers
                             .entry(addr)
-                            .and_modify(|regs| regs.push((per, reg)))
-                            .or_insert_with(|| vec![(per, reg)]);
+                            .and_modify(|regs| {
+                                regs.push((per, reg, cluster_dim))
+                            })
+                            .or_insert_with(|| vec![(per, reg, cluster_dim)]);
                     }
                 }
             }
@@ -56,7 +68,7 @@ impl<'a> Peripherals<'a> {
                 Ok((addr, RegisterAccess::new(regs)?))
             })
             .collect::<Result<_, _>>()?;
-        let memory = memory::pages_from_chunks(ADDR_BITS, svds);
+        let memory = memory::pages_from_chunks(ADDR_BITS, &registers);
         Ok(Self {
             memory,
             svds,

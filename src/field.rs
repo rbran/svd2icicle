@@ -45,7 +45,7 @@ impl FieldData {
 
 #[derive(Debug)]
 pub struct FieldAccess<'a> {
-    pub dim: u32,
+    pub dim: (u32, u32),
     pub read: Option<Ident>,
     pub write: Option<Ident>,
     pub data: FieldData,
@@ -57,7 +57,7 @@ pub struct FieldAccess<'a> {
 impl<'a> FieldAccess<'a> {
     pub fn new(
         fields: Vec<(&'a Peripheral, &'a Register, &'a Field)>,
-        dim: u32,
+        dim: (u32, u32),
         per_name: &str,
         reg_name: &str,
         default_access: Access,

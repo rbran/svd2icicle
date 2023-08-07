@@ -1,8 +1,8 @@
 use std::ops::Range;
 
+use indexmap::IndexMap;
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
-use svd_parser::svd::Device;
 
 use crate::{
     helper, peripheral::Peripherals, register::RegisterAccess, PAGE_MASK,
@@ -108,7 +108,7 @@ impl MemoryPage {
         } else {
             let registers_read =
                 registers_in_chunk.clone().flat_map(|(addr, reg)| {
-                    self.call_register_from_chunk(*addr, reg, true)
+                    self.call_register_from_chunk(chunk, *addr, reg, true)
                 });
             quote! {
                 (#start..=#endm1, #startp1..=#end) => {
@@ -124,7 +124,7 @@ impl MemoryPage {
             quote! { (#start..=#endm1, #startp1..=#end) => return Err(MemError::WriteViolation), }
         } else {
             let registers_write = registers_in_chunk.flat_map(|(addr, reg)| {
-                self.call_register_from_chunk(*addr, reg, false)
+                self.call_register_from_chunk(chunk, *addr, reg, false)
             });
             quote! {
                 (#start..=#endm1, #startp1..=#end) => {
@@ -138,17 +138,22 @@ impl MemoryPage {
 
     fn call_register_from_chunk<'b>(
         &'b self,
+        chunk: &'b MemoryChunk,
         reg_addr: u64,
         reg: &'b RegisterAccess,
         read: bool,
     ) -> impl Iterator<Item = TokenStream> + 'b {
-        (0..reg.dim).map(move |dim_i| {
+        (0..reg.dim.0).map(move |dim_i| {
             let chunk_offset = reg_addr - self.addr;
-            let dim_offset = dim_i as u64 * reg.bytes as u64;
+            let dim_offset = (dim_i as u64 * reg.dim.1 as u64) * reg.bytes as u64;
             let reg_start = chunk_offset + dim_offset;
+            // if not in this chunk, do nothing
+            if chunk.0.contains(&dim_offset) {
+                return quote!{};
+            }
             let reg_end = reg_start + reg.bytes as u64;
             let value = format_ident!("_value");
-            let dim = (reg.dim > 1).then(|| Literal::u32_unsuffixed(dim_i));
+            let dim = (reg.dim.0 > 1).then(|| Literal::u32_unsuffixed(dim_i));
 
             let range_start = Literal::u64_unsuffixed(reg_start);
             let range_end = Literal::u64_unsuffixed(reg_end);
@@ -245,38 +250,23 @@ pub struct MemoryChunk(pub Range<u64>);
 
 /// create a page-mapped list of peripherals
 /// TODO check that each page is aligned
-pub fn pages_from_chunks(addr_bits: u32, svds: &[Device]) -> Vec<MemoryPage> {
+pub fn pages_from_chunks(
+    addr_bits: u32,
+    registers: &IndexMap<u64, RegisterAccess>,
+) -> Vec<MemoryPage> {
     let page_mask = (u64::MAX >> addr_bits) << addr_bits;
     let mut chunks = Vec::new();
-    for per in svds.iter().flat_map(|svd| svd.peripherals.iter()) {
-        for reg in per.all_registers() {
-            let start = per.base_address + reg.address_offset as u64;
-            let bits = reg
-                .properties
-                .size
-                .or(per.default_register_properties.size)
-                .unwrap();
-            match reg {
-                svd_parser::svd::MaybeArray::Single(_reg) => {
-                    let end = start + (bits as u64 / 8);
-                    // don't allow register between pages
-                    assert_eq!(
-                        start & page_mask,
-                        (end - 1) & page_mask,
-                        "reg start {start} end {end}"
-                    );
-                    chunks.push(MemoryChunk(start..end))
-                }
-                svd_parser::svd::MaybeArray::Array(_reg, dim) => {
-                    let mut start = start;
-                    for _ in 0..dim.dim {
-                        let end = start + (bits as u64 / 8);
-                        chunks.push(MemoryChunk(start..end));
-
-                        start += dim.dim_increment as u64;
-                    }
-                }
-            }
+    for (addr, regs) in registers.iter() {
+        let reg_offset = *addr as u64;
+        for dim_i in 0..regs.dim.0 {
+            let start = reg_offset + (dim_i as u64 * regs.dim.1 as u64);
+            let end = start + regs.bytes as u64;
+            assert_eq!(
+                start & page_mask,
+                (end - 1) & page_mask,
+                "reg start {start} end {end}"
+            );
+            chunks.push(MemoryChunk(start..end))
         }
     }
     // sort chunks so lowest address comes first, also but biggest first to
