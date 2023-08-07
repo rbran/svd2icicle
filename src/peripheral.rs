@@ -5,7 +5,6 @@ use proc_macro2::Literal;
 use proc_macro2::TokenStream;
 use quote::quote;
 use svd_parser::svd::Device;
-use svd_parser::svd::MaybeArray;
 
 use crate::register::RegisterAccess;
 use crate::{memory, PAGE_LEN};
@@ -45,20 +44,14 @@ impl<'a> Peripherals<'a> {
                     if clu.clusters().count() != 0 {
                         todo!("cluster inside other cluster");
                     }
-                    let cluster_dim = match clu {
-                        MaybeArray::Array(_clu, dim) => {
-                            Some((dim.dim, dim.dim_increment))
-                        }
-                        _ => todo!("not arrau cluster"),
-                    };
                     for reg in clu.registers() {
                         let addr = addr + reg.address_offset as u64;
                         registers
                             .entry(addr)
                             .and_modify(|regs| {
-                                regs.push((per, reg, cluster_dim))
+                                regs.push((per, reg, Some(clu)))
                             })
-                            .or_insert_with(|| vec![(per, reg, cluster_dim)]);
+                            .or_insert_with(|| vec![(per, reg, Some(clu))]);
                     }
                 }
             }

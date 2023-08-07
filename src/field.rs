@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, ToTokens};
-use svd_parser::svd::{Access, Field, Name, Peripheral, Register};
+use svd_parser::svd::{Field, Name, Peripheral, Register};
 
 use crate::{formater::*, helper};
 
@@ -61,8 +61,9 @@ impl<'a> FieldAccess<'a> {
         offset: u32,
         is_dim: bool,
         per_name: &str,
+        clu_name: Option<&str>,
         reg_name: &str,
-        default_access: Access,
+        default_rw: (bool, bool),
         reg_reset_value: u64,
         reg_reset_mask: u64,
     ) -> Result<Self> {
@@ -95,20 +96,44 @@ impl<'a> FieldAccess<'a> {
             (first, bytes, last) => FieldData::Multiple { first, bytes, last },
         };
 
-        // all fields need to have the same access permissions
-        let mut access_iter = fields
+        // fields can't have more permissions then the regs that contains it
+        let rw = fields
             .iter()
-            .map(|(_per, _reg, field)| field.access.unwrap_or(default_access));
-        let access = access_iter.next().unwrap();
-        if access_iter.any(|other_access| other_access != access) {
+            .filter_map(|(_per, reg, field)| {
+                field.access.or(reg.properties.access)
+            })
+            .map(|access| (access.can_read(), access.can_write()))
+            .reduce(|rw1, rw2| (rw1.0 | rw2.0, rw1.1 | rw2.1))
+            .unwrap_or(default_rw);
+        if default_rw != rw {
             bail!("fields {} with diferent permissions", field_names(),)
         }
 
-        let read = access
-            .can_read()
-            .then(|| format_ident!("read_{}_{}_{}", per_name, reg_name, &name));
-        let write = access.can_write().then(|| {
-            format_ident!("write_{}_{}_{}", per_name, reg_name, &name)
+        let read = rw.0.then(|| {
+            if let Some(clu) = clu_name {
+                format_ident!(
+                    "read_{}_{}_{}_{}",
+                    per_name,
+                    clu,
+                    reg_name,
+                    &name
+                )
+            } else {
+                format_ident!("read_{}_{}_{}", per_name, reg_name, &name)
+            }
+        });
+        let write = rw.1.then(|| {
+            if let Some(clu) = clu_name {
+                format_ident!(
+                    "write_{}_{}_{}_{}",
+                    per_name,
+                    clu,
+                    reg_name,
+                    &name
+                )
+            } else {
+                format_ident!("write_{}_{}_{}", per_name, reg_name, &name)
+            }
         });
 
         let bits = u64::MAX >> (u64::BITS - width);

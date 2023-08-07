@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, Result};
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
-use svd_parser::svd::{MaybeArray, Name, Peripheral, Register};
+use svd_parser::svd::{ClusterInfo, MaybeArray, Name, Peripheral, Register};
 
 use crate::field::{FieldAccess, FieldData};
 use crate::formater::{self, dim_to_n, snake_case};
@@ -15,8 +15,13 @@ pub struct RegisterAccess<'a> {
     pub write_fun: Option<Ident>,
     pub base_addr: u64,
     dim: (u32, u32),
+    pub rw: (bool, bool),
     pub bytes: u32,
-    pub regs: Vec<(&'a Peripheral, &'a Register, Option<(u32, u32)>)>,
+    pub regs: Vec<(
+        &'a Peripheral,
+        &'a Register,
+        Option<&'a MaybeArray<ClusterInfo>>,
+    )>,
     pub fields: Vec<FieldAccess<'a>>,
     /// reset value, except for the fields (0s there)
     pub clean_value: u64,
@@ -27,12 +32,24 @@ pub struct RegisterAccess<'a> {
 impl<'a> RegisterAccess<'a> {
     pub fn new(
         base_addr: u64,
-        regs: Vec<(&'a Peripheral, &'a Register, Option<(u32, u32)>)>,
+        regs: Vec<(
+            &'a Peripheral,
+            &'a Register,
+            Option<&'a MaybeArray<ClusterInfo>>,
+        )>,
     ) -> Result<Self> {
         // all register names, used for error messages
         let regs_names = || {
             regs.iter()
-                .map(|(per, reg, _)| format!("{}::{}", per.name(), reg.name()))
+                .map(|(per, reg, clu)| match clu {
+                    Some(clu) => format!(
+                        "{}::{}::{}",
+                        per.name(),
+                        clu.name(),
+                        reg.name()
+                    ),
+                    None => format!("{}::{}", per.name(), reg.name()),
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -51,25 +68,31 @@ impl<'a> RegisterAccess<'a> {
                 .collect()
         };
         //TODO how to handle regs with multiple names?
+        let cluster_name = regs
+            .iter()
+            .find_map(|(_, _, clu)| clu.as_ref())
+            .map(|clu| snake_case(&dim_to_n(clu.name())));
         let name = snake_case(&dim_to_n(&regs[0].1.name));
 
         // registers can have diferent dims, use the biggest one, dim increment
         // need to be the same size
         let mut dim_iter =
-            regs.iter().filter_map(|(_per, reg, clu_dim)| {
-                match (reg, clu_dim) {
-                    (MaybeArray::Array(_reg, _dim), Some(_)) => {
-                        todo!(
-                            "registers {}::{} with dim inside a cluster",
-                            regs[0].0.name(),
-                            regs[0].1.name(),
-                        )
-                    }
-                    (MaybeArray::Array(_reg, dim), None) => {
-                        Some((dim.dim, dim.dim_increment))
-                    }
-                    (MaybeArray::Single(_), clu_dim) => *clu_dim,
+            regs.iter().filter_map(|(_per, reg, clu)| match (reg, clu) {
+                (MaybeArray::Array(_, _), Some(MaybeArray::Array(_, _))) => {
+                    todo!(
+                        "registers {}::{} with dim inside a cluster",
+                        regs[0].0.name(),
+                        regs[0].1.name(),
+                    )
                 }
+                (MaybeArray::Single(_), None | Some(MaybeArray::Single(_))) => {
+                    None
+                }
+                (MaybeArray::Single(_), Some(MaybeArray::Array(_, dim)))
+                | (
+                    MaybeArray::Array(_, dim),
+                    None | Some(MaybeArray::Single(_)),
+                ) => Some((dim.dim, dim.dim_increment)),
             });
         let dim_num = dim_iter
             .clone()
@@ -85,31 +108,31 @@ impl<'a> RegisterAccess<'a> {
             )
         }
 
-        // all register need to have the same access permissions
-        let mut access_iter = regs.iter().map(|(per, reg, _)| {
-            reg.properties
-                .access
-                .or(per.default_register_properties.access)
+        // the permissions are combined
+        let (r, w) = regs
+            .iter()
+            .filter_map(|(per, reg, _)| {
+                reg.properties
+                    .access
+                    .or(per.default_register_properties.access)
+            })
+            .fold((false, false), |(r, w), access| {
+                (r | access.can_read(), w | access.can_write())
+            });
+        let read_fun = r.then(|| {
+            if let Some(clu) = &cluster_name {
+                format_ident!("read_{}_{}_{}", &per_name, clu, name)
+            } else {
+                format_ident!("read_{}_{}", &per_name, name)
+            }
         });
-        let access = access_iter.next().unwrap().ok_or_else(|| {
-            anyhow!(
-                "registers {}::{} without permissions",
-                regs[0].0.name(),
-                regs[0].1.name(),
-            )
-        })?;
-        if access_iter.any(|other_access| other_access != Some(access)) {
-            bail!(
-                "overlapping registers {} with diferent permissions",
-                regs_names(),
-            )
-        }
-        let read_fun = access
-            .can_read()
-            .then(|| format_ident!("read_{}_{}", &per_name, name));
-        let write_fun = access
-            .can_write()
-            .then(|| format_ident!("write_{}_{}", &per_name, name));
+        let write_fun = w.then(|| {
+            if let Some(clu) = &cluster_name {
+                format_ident!("write_{}_{}_{}", &per_name, clu, name)
+            } else {
+                format_ident!("write_{}_{}", &per_name, name)
+            }
+        });
 
         let mut regs_sizes = regs.iter().map(|(per, reg, _)| {
             reg.properties.size.or(per.default_register_properties.size)
@@ -178,8 +201,9 @@ impl<'a> RegisterAccess<'a> {
                     offset,
                     dim_num > 1,
                     &per_name,
+                    cluster_name.as_ref().map(|x| x.as_str()),
                     &name,
-                    access,
+                    (r, w),
                     reset_value,
                     reset_mask,
                 )
@@ -188,6 +212,7 @@ impl<'a> RegisterAccess<'a> {
         fields.sort_by_key(|f| f.offset);
 
         Ok(Self {
+            rw: (r, w),
             base_addr,
             dim: (dim_num, dim_inc),
             bytes,
