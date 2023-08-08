@@ -250,7 +250,7 @@ impl MemoryPage {
                     }
                 } else {
                     quote! {
-                        if #in_range { return Err(MemError::ReadViolation); }
+                        if #in_range { return Err(MemError::WriteViolation); }
                     }
                 }
             }
