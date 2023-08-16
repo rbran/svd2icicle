@@ -1,173 +1,116 @@
 use std::collections::HashMap;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
-use svd_parser::svd::{ClusterInfo, MaybeArray, Name, Peripheral, Register};
+use svd_parser::svd::{
+    ClusterInfo, DimElement, MaybeArray, Name, RegisterInfo, RegisterProperties,
+};
 
 use crate::field::{FieldAccess, FieldData};
-use crate::formater::{self, dim_to_n, snake_case};
-use crate::helper;
+use crate::formater::dim_to_n;
+use crate::helper::{self, Dim};
+use crate::memory::{
+    Context, Memory, MemoryChunks, MemoryThingCondensated, MemoryThingFinal,
+};
+use crate::peripheral::PeripheralPage;
+
+pub struct ClusterAccess<'a> {
+    pub bytes: u64,
+    pub clusters: Vec<&'a MaybeArray<ClusterInfo>>,
+    pub memory: MemoryChunks<MemoryThingFinal<'a>>,
+}
+
+impl<'a> ClusterAccess<'a> {
+    pub(crate) fn new<'b>(
+        context: &mut Context<'b>,
+        clusters: Vec<&'a MaybeArray<ClusterInfo>>,
+        memory: MemoryChunks<MemoryThingCondensated<'a>>,
+    ) -> Result<Self> {
+        // generate the names
+        let mut bytes = memory.len();
+        if let Some(dim) = clusters[0].array() {
+            bytes = dim.dim as u64 * dim.dim_increment as u64;
+        }
+        // combine the clusters names, if they overlap
+        let cluster_name = clusters
+            .iter()
+            .map(|cluster| dim_to_n(&cluster.name().to_lowercase()))
+            .collect();
+        context.clusters.push(cluster_name);
+        let memory = memory.finalize(context)?;
+        context.clusters.pop();
+        Ok(Self {
+            clusters,
+            bytes,
+            memory,
+        })
+    }
+
+    pub(crate) fn gen_register_functions(
+        &self,
+        peripheral: &PeripheralPage,
+    ) -> TokenStream {
+        self.memory.gen_register_fun(peripheral)
+    }
+
+    pub(crate) fn gen_fields_functions(
+        &self,
+        peripheral: &PeripheralPage,
+    ) -> TokenStream {
+        self.memory.gen_fields_functions(peripheral)
+    }
+}
 
 #[derive(Debug)]
 pub struct RegisterAccess<'a> {
     pub read_fun: Option<Ident>,
     pub write_fun: Option<Ident>,
-    pub base_addr: u64,
-    dim: (u32, u32),
-    pub rw: (bool, bool),
-    pub bytes: u32,
-    pub regs: Vec<(
-        &'a Peripheral,
-        &'a Register,
-        Option<&'a MaybeArray<ClusterInfo>>,
-    )>,
+    pub registers: Vec<&'a MaybeArray<RegisterInfo>>,
     pub fields: Vec<FieldAccess<'a>>,
-    /// reset value, except for the fields (0s there)
+    pub properties: RegisterProperties,
+    /// reset value, except for the fields (0s in there)
     pub clean_value: u64,
-    pub reset_value: u64,
-    pub reset_mask: u64,
 }
 
 impl<'a> RegisterAccess<'a> {
-    pub fn new(
-        base_addr: u64,
-        regs: Vec<(
-            &'a Peripheral,
-            &'a Register,
-            Option<&'a MaybeArray<ClusterInfo>>,
-        )>,
+    pub(crate) fn new(
+        context: &Context,
+        properties: RegisterProperties,
+        registers: Vec<&'a MaybeArray<RegisterInfo>>,
     ) -> Result<Self> {
         // all register names, used for error messages
         let regs_names = || {
-            regs.iter()
-                .map(|(per, reg, clu)| match clu {
-                    Some(clu) => format!(
-                        "{}::{}::{}",
-                        per.name(),
-                        clu.name(),
-                        reg.name()
-                    ),
-                    None => format!("{}::{}", per.name(), reg.name()),
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
+            format!(
+                "{} registers {}",
+                context.gen_register_fun_name(""),
+                registers
+                    .iter()
+                    .map(|reg| reg.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         };
 
-        // combine the names of all peripherals
-        let per_name: String = {
-            let mut pers = std::collections::HashSet::new();
-            regs.iter()
-                .filter_map(move |(per, _reg, _)| {
-                    pers.insert(
-                        (*per as *const svd_parser::svd::MaybeArray<_>)
-                            as usize,
-                    )
-                    .then_some(formater::snake_case(per.name.as_str()))
-                })
-                .collect()
-        };
-        //TODO how to handle regs with multiple names?
-        let cluster_name = regs
-            .iter()
-            .find_map(|(_, _, clu)| clu.as_ref())
-            .map(|clu| snake_case(&dim_to_n(clu.name())));
-        let name = snake_case(&dim_to_n(&regs[0].1.name));
-
-        // registers can have diferent dims, use the biggest one, dim increment
-        // need to be the same size
-        let mut dim_iter =
-            regs.iter().filter_map(|(_per, reg, clu)| match (reg, clu) {
-                (MaybeArray::Array(_, _), Some(MaybeArray::Array(_, _))) => {
-                    todo!(
-                        "registers {}::{} with dim inside a cluster",
-                        regs[0].0.name(),
-                        regs[0].1.name(),
-                    )
-                }
-                (MaybeArray::Single(_), None | Some(MaybeArray::Single(_))) => {
-                    None
-                }
-                (MaybeArray::Single(_), Some(MaybeArray::Array(_, dim)))
-                | (
-                    MaybeArray::Array(_, dim),
-                    None | Some(MaybeArray::Single(_)),
-                ) => Some((dim.dim, dim.dim_increment)),
-            });
-        let dim_num = dim_iter
-            .clone()
-            .map(|(dim_num, _)| dim_num)
-            .max()
-            .unwrap_or(1);
-        let (_, dim_inc) = dim_iter.next().unwrap_or((1, 0));
-        if dim_iter.any(|(_, this_dim_inc)| dim_inc != this_dim_inc) {
-            bail!(
-                "registers {}::{} with invalid dim_incr",
-                regs[0].0.name(),
-                regs[0].1.name(),
-            )
-        }
-
-        // the permissions are combined
-        let (r, w) = regs
-            .iter()
-            .filter_map(|(per, reg, _)| {
-                reg.properties
-                    .access
-                    .or(per.default_register_properties.access)
-            })
-            .fold((false, false), |(r, w), access| {
-                (r | access.can_read(), w | access.can_write())
-            });
-        let read_fun = r.then(|| {
-            if let Some(clu) = &cluster_name {
-                format_ident!("read_{}_{}_{}", &per_name, clu, name)
-            } else {
-                format_ident!("read_{}_{}", &per_name, name)
-            }
-        });
-        let write_fun = w.then(|| {
-            if let Some(clu) = &cluster_name {
-                format_ident!("write_{}_{}_{}", &per_name, clu, name)
-            } else {
-                format_ident!("write_{}_{}", &per_name, name)
-            }
-        });
-
-        let mut regs_sizes = regs.iter().map(|(per, reg, _)| {
-            reg.properties.size.or(per.default_register_properties.size)
-        });
-        let bits = regs_sizes.next().unwrap().ok_or_else(|| {
-            anyhow!(
-                "registers {}::{} without size",
-                regs[0].0.name(),
-                regs[0].1.name(),
-            )
-        })?;
-        if regs_sizes.any(|o_bits| o_bits != Some(bits)) {
-            bail!("overlapping register {} with diferent sizes", regs_names())
-        }
-        if bits % 8 != 0 {
-            bail!(
-                "overlapping register {} with invalid size {}bits",
-                regs_names(),
-                bits,
-            )
-        }
-        let bytes = bits / 8;
-
-        let mut fields: HashMap<u32, Vec<_>> = HashMap::new();
-        for (per, reg, field) in regs.iter().flat_map(|(per, reg, _)| {
-            reg.fields().map(move |field| (*per, *reg, field))
-        }) {
-            fields
-                .entry(field.bit_offset())
-                .and_modify(|regs| regs.push((per, reg, field)))
-                .or_insert_with(|| vec![(per, reg, field)]);
-        }
+        // generate the names
+        let reg_name = dim_to_n(&registers[0].name().to_owned()).to_lowercase();
+        // NOTE address offset is used, because diferent registers, that dont
+        // overlap, from diferent pheripherals, that overlap, have the same name
+        let reg_name = format!("{reg_name}{:x}", registers[0].address_offset);
+        let name = context.gen_register_fun_name(&reg_name);
+        let read_fun = properties
+            .access
+            .unwrap()
+            .can_read()
+            .then(|| format_ident!("{}_read", name));
+        let write_fun = properties
+            .access
+            .unwrap()
+            .can_write()
+            .then(|| format_ident!("{}_write", name));
 
         // all register need to have the same reset_value
-        let mut reset_value_mask_iter = regs.iter().map(|(_per, reg, _)| {
+        let mut reset_value_mask_iter = registers.iter().map(|reg| {
             let value = reg.properties.reset_value.unwrap_or(0);
             let mask = reg.properties.reset_mask.unwrap_or(u64::MAX);
             (value, mask)
@@ -181,119 +124,127 @@ impl<'a> RegisterAccess<'a> {
                 regs_names(),
             )
         }
-        // remove the fields from the reset value
-        let clean_value = fields.iter().fold(
-            reset_value & reset_mask,
-            |clean, (_offset, field)| {
-                let bits = u64::MAX >> (u64::BITS - field[0].2.bit_width());
-                let mask = bits << field[0].2.lsb();
-                clean & !mask
-            },
-        );
 
-        // TODO check if the fields overlap or goes outside the register
+        let mut fields: HashMap<u32, Vec<_>> = HashMap::new();
+        for field in registers.iter().flat_map(|reg| reg.fields()) {
+            fields
+                .entry(field.bit_offset())
+                .or_insert_with(|| vec![])
+                .push(field);
+        }
         let mut fields: Vec<_> = fields
-            .into_iter()
-            .map(|(offset, fields)| {
+            .into_values()
+            .map(|fields| {
                 // TODO compare field access with register access
                 FieldAccess::new(
+                    context,
+                    &properties,
                     fields,
-                    offset,
-                    dim_num > 1,
-                    &per_name,
-                    cluster_name.as_ref().map(|x| x.as_str()),
-                    &name,
-                    (r, w),
+                    registers[0].is_array(),
+                    &reg_name,
                     reset_value,
                     reset_mask,
                 )
             })
             .collect::<Result<_, _>>()?;
-        fields.sort_by_key(|f| f.offset);
+        fields.sort_unstable_by_key(|field| field.fields[0].bit_offset());
+
+        // TODO check for overlapping fields
+
+        // remove the fields from the reset value
+        let clean_value =
+            fields
+                .iter()
+                .fold(reset_value & reset_mask, |clean, field| {
+                    let bits =
+                        u64::MAX >> (u64::BITS - field.fields[0].bit_width());
+                    let mask = bits << field.fields[0].lsb();
+                    clean & !mask
+                });
 
         Ok(Self {
-            rw: (r, w),
-            base_addr,
-            dim: (dim_num, dim_inc),
-            bytes,
             read_fun,
             write_fun,
-            regs,
+            registers,
             fields,
             clean_value,
-            reset_value,
-            reset_mask,
+            properties,
         })
     }
 
-    pub fn is_dim(&self) -> bool {
-        self.dim.0 > 1
+    pub fn implicit_field(&self) -> bool {
+        self.fields.is_empty()
     }
 
-    pub fn dim_iter<'b>(&'b self) -> impl Iterator<Item = u64> + 'b {
-        let mut acc = self.base_addr;
-        (0..self.dim.0).map(move |_i| {
-            let next = acc;
-            acc += self.dim.1 as u64;
-            next
-        })
-    }
-
-    /// true if is compose of a single field with the same len then the register
-    pub fn is_single_field(&self) -> bool {
-        // if no fields, means it is a single implicit field
-        if self.fields.is_empty() {
-            return true;
-        }
-
-        // only one field and it have the same size then the register
-        if self.fields.len() == 1 {
-            match self.fields[0].data {
-                FieldData::Single(8) if self.bytes == 1 => true,
-                FieldData::Multiple {
-                    first: 0,
-                    bytes,
-                    last: 0,
-                } if self.bytes == bytes => true,
-                _ => false,
-            }
+    pub(crate) fn gen_fields_functions(
+        &self,
+        _peripheral: &PeripheralPage,
+        tokens: &mut TokenStream,
+    ) {
+        if !self.implicit_field() {
+            self.fields.iter().for_each(|x| x.to_tokens(tokens))
         } else {
-            false
+            // implicit field, generate the pseudo field for this register
+            let docs: Vec<_> = self
+                .registers
+                .iter()
+                .filter_map(|reg| {
+                    Some(format!(
+                        "{}: {}\n",
+                        reg.name(),
+                        reg.description.as_ref()?,
+                    ))
+                })
+                .collect();
+            let docs = docs.join("\n\n");
+            let name: Vec<_> = self
+                .registers
+                .iter()
+                .map(|reg| format!("{}", reg.name()))
+                .collect();
+            let name = name.join(", ");
+            helper::read_write_field(
+                self.array().is_some(),
+                &name,
+                self.read_fun.as_ref(),
+                self.write_fun.as_ref(),
+                FieldData::from_bytes(self.properties.size.unwrap() / 8),
+                self.properties.reset_value.unwrap_or(0),
+                self.properties.reset_mask.unwrap_or(0),
+                &docs,
+                tokens,
+            )
         }
     }
 
-    pub fn mem_map_functions(&self) -> impl ToTokens + '_ {
-        struct Tokens<'a, 'b: 'a>(&'b RegisterAccess<'a>);
-        impl ToTokens for Tokens<'_, '_> {
-            fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
-                self.0.gen_mem_map_functions(tokens)
-            }
-        }
-        Tokens(self)
-    }
-
-    fn gen_mem_map_functions(&self, tokens: &mut proc_macro2::TokenStream) {
-        // if is single fields, there is no need to create a function
-        // in pages, we can call the function from `Peripherals` directly
-        if self.is_single_field() {
+    pub(crate) fn gen_register_function(
+        &self,
+        peripheral: &PeripheralPage,
+        tokens: &mut TokenStream,
+    ) {
+        let peripheral_field = &peripheral.field_name;
+        let dim_declare = self.array().map(|_| quote! {_dim: usize,});
+        let dim_use = self.array().map(|_| quote! {_dim,});
+        let clean_value = Literal::u64_unsuffixed(self.clean_value);
+        let bytes = self.properties.size.unwrap() / 8;
+        let value_type = helper::DataType::from_bytes(bytes);
+        if self.implicit_field() {
+            self.gen_register_function_implicit_field(peripheral, tokens);
             return;
         }
-        let dim_declare = self.is_dim().then(|| quote! {_dim: usize,});
-        let dim_use = self.is_dim().then(|| quote! {_dim,});
-        let clean_value = Literal::u64_unsuffixed(self.clean_value);
-        let value_type = helper::DataType::from_bytes(self.bytes);
-        if self.bytes == 1 {
+        if bytes == 1 {
             if let Some(read) = self.read_fun.as_ref() {
                 let fields = self.fields.iter().filter_map(|field| {
                     let field_fun = field.read.as_ref()?;
-                    let lsb = field.fields[0].2.lsb();
+                    let lsb = field.fields[0].lsb();
+                    let rotate = (lsb > 0).then(|| quote! { << #lsb});
                     Some(quote! {
-                        self.0.lock().unwrap().#field_fun(#dim_use)? << #lsb;
+                        self.#peripheral_field.#field_fun(#dim_use)? #rotate;
                     })
                 });
                 tokens.extend(quote! {
-                    fn #read(
-                        &self,
+                    pub fn #read(
+                        &mut self,
                         #dim_declare
                     ) -> MemResult<#value_type> {
                         let mut _value = #clean_value;
@@ -305,20 +256,20 @@ impl<'a> RegisterAccess<'a> {
             if let Some(write) = self.write_fun.as_ref() {
                 let fields = self.fields.iter().filter_map(|field| {
                     let field_fun = field.write.as_ref()?;
-                    let lsb = field.fields[0].2.lsb();
+                    let lsb = field.fields[0].lsb();
+                    let rotate = (lsb > 0).then(|| quote! { >> #lsb});
                     let mask =
-                        u8::MAX >> (u8::BITS - field.fields[0].2.bit_width());
-                    let dim =
-                        (self.dim.0 > 1).then(|| quote! {_dim}).into_iter();
+                        u8::MAX >> (u8::BITS - field.fields[0].bit_width());
+                    let dim = self.array().map(|_| quote! {_dim}).into_iter();
                     Some(quote! {
-                        self.0.lock().unwrap().#field_fun(
+                        self.#peripheral_field.#field_fun(
                             #(#dim,)*
-                            (_value >> #lsb) #mask
+                            (_value #rotate) & #mask
                         )?;
                     })
                 });
                 tokens.extend(quote! {
-                    fn #write(
+                    pub fn #write(
                         &mut self,
                         #dim_declare
                         _value: #value_type,
@@ -332,17 +283,18 @@ impl<'a> RegisterAccess<'a> {
             if let Some(read) = self.read_fun.as_ref() {
                 let fields = self.fields.iter().map(|field| {
                     let read = field.read.as_ref().unwrap();
-                    let lsb = field.fields[0].2.lsb();
+                    let lsb = field.fields[0].lsb();
+                    let rotate = (lsb > 0).then(|| quote! { << #lsb});
                     quote! {
                         _value |= #value_type::from(
-                            self.0.lock().unwrap().#read(#dim_use)?
-                        ) << #lsb;
+                            self.#peripheral_field.#read(#dim_use)?
+                        ) #rotate;
                     }
                 });
                 let clean_value = Literal::u64_unsuffixed(self.clean_value);
                 tokens.extend(quote! {
                     // NOTE no comma on dim_declare
-                    fn #read(&self, #dim_declare) -> MemResult<#value_type> {
+                    pub fn #read(&mut self, #dim_declare) -> MemResult<#value_type> {
                         let mut _value = #clean_value;
                         #(#fields)*
                         Ok(_value)
@@ -351,9 +303,9 @@ impl<'a> RegisterAccess<'a> {
             }
             if let Some(write) = self.write_fun.as_ref() {
                 let fields = self.fields.iter().map(|field| {
-                    let field_start = field.fields[0].2.lsb() / 8;
+                    let field_start = field.fields[0].lsb() / 8;
                     let field_bytes = field.data.bytes();
-                    let field_lsb = Literal::u32_unsuffixed(field.fields[0].2.lsb() % 8);
+                    let field_lsb = Literal::u32_unsuffixed(field.fields[0].lsb() % 8);
                     let field_end = Literal::u32_unsuffixed(field_start + field_bytes);
                     let field_start = Literal::u32_unsuffixed(field_start);
 
@@ -370,7 +322,7 @@ impl<'a> RegisterAccess<'a> {
                                 // TODO implement byte endian here
                                 if (_start.._end).contains(&#field_start) {
                                     let _i = (#field_start - _start) as usize;
-                                    self.0.lock().unwrap().#write(
+                                    self.#peripheral_field.#write(
                                         #dim_use
                                         (_value[_i] >> #field_lsb) & #mask,
                                     )?;
@@ -389,7 +341,7 @@ impl<'a> RegisterAccess<'a> {
                                         _value[_offset_start.._offset_end]
                                         .try_into().unwrap()
                                     );
-                                    self.0.lock().unwrap().#write(#dim_use _value)?;
+                                    self.#peripheral_field.#write(#dim_use _value)?;
                                 } else if (_start > #field_start && _start < #field_end)
                                     || (_end > #field_start && _end < #field_end) {
                                     return Err(MemError::WriteViolation);
@@ -431,7 +383,7 @@ impl<'a> RegisterAccess<'a> {
                                     #first_byte
                                     #middle_bytes
                                     #last_byte
-                                    self.0.lock().unwrap().#write(#dim_use _extracted)?;
+                                    self.#peripheral_field.#write(#dim_use _extracted)?;
                                 } else if (_start > #field_start && _start < #field_end)
                                     || (_end > #field_start && _end < #field_end) {
                                     return Err(MemError::WriteViolation);
@@ -444,7 +396,7 @@ impl<'a> RegisterAccess<'a> {
                 // TODO implement byte endian here
                 tokens.extend(quote! {
                     // NOTE no comma on dim_declare
-                    fn #write(
+                    pub fn #write(
                         &mut self,
                         #dim_declare
                         _start: u64,
@@ -460,50 +412,55 @@ impl<'a> RegisterAccess<'a> {
         }
     }
 
-    fn gen_fields_functions(&self, tokens: &mut TokenStream) {
-        if self.is_single_field() {
-            let docs: Vec<_> = self
-                .regs
-                .iter()
-                .filter_map(|(per, reg, _)| {
-                    Some(format!(
-                        "{} {}: {}",
-                        per.name(),
-                        reg.name(),
-                        reg.description.as_ref()?,
-                    ))
-                })
-                .collect();
-            let docs = docs.join("\n\n");
-            let name: Vec<_> = self
-                .regs
-                .iter()
-                .map(|(per, reg, _)| format!("{} {}", per.name(), reg.name()))
-                .collect();
-            let name = name.join(", ");
-            helper::read_write_field(
-                self.dim.0 > 1,
-                &name,
-                self.read_fun.as_ref(),
-                self.write_fun.as_ref(),
-                FieldData::from_bytes(self.bytes),
-                self.reset_value,
-                self.reset_mask,
-                &docs,
-                tokens,
-            )
-        } else {
-            self.fields.iter().for_each(|x| x.to_tokens(tokens))
+    fn gen_register_function_implicit_field(
+        &self,
+        peripheral: &PeripheralPage,
+        tokens: &mut TokenStream,
+    ) {
+        let dim_use = self.array().map(|_| quote! {_dim});
+        let peripheral_field = &peripheral.field_name;
+        let dim_declare = self.array().map(|_| quote! {_dim: usize,});
+        let bytes = self.properties.size.unwrap() / 8;
+        let bytes_lit = Literal::u32_unsuffixed(bytes);
+        let value_type = helper::DataType::from_bytes(bytes);
+        if bytes == 1 {
+            todo!("one byte register");
+        }
+        if let Some(read) = &self.read_fun {
+            tokens.extend(quote! {
+                pub fn #read(
+                    &mut self,
+                    #dim_declare
+                ) -> MemResult<#value_type> {
+                    self.#peripheral_field.#read(#dim_use)
+                }
+            })
+        }
+        if let Some(write) = &self.write_fun {
+            let dim_use = dim_use.into_iter();
+            // TODO implement byte endian here
+            tokens.extend(quote! {
+                pub fn #write(
+                    &mut self,
+                    #dim_declare
+                    _start: u64,
+                    _value: &[u8],
+                ) -> MemResult<()> {
+                    if _start != 0 || _value.len() != #bytes_lit {
+                        return Err(MemError::WriteViolation);
+                    }
+                    self.#peripheral_field.#write(
+                        #(#dim_use,)*
+                        #value_type::from_ne_bytes(_value.try_into().unwrap()),
+                    )
+                }
+            })
         }
     }
+}
 
-    pub fn fields_functions(&self) -> impl ToTokens + '_ {
-        struct Token<'b>(&'b RegisterAccess<'b>);
-        impl ToTokens for Token<'_> {
-            fn to_tokens(&self, tokens: &mut TokenStream) {
-                self.0.gen_fields_functions(tokens)
-            }
-        }
-        Token(self)
+impl Dim for RegisterAccess<'_> {
+    fn array(&self) -> Option<&DimElement> {
+        self.registers[0].array()
     }
 }

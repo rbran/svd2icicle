@@ -1,5 +1,6 @@
 use proc_macro2::{Ident, TokenStream};
 use quote::{quote, ToTokens};
+use svd_parser::svd::{DimElement, MaybeArray};
 
 use crate::field::FieldData;
 
@@ -14,7 +15,6 @@ pub enum DataType {
 }
 
 impl DataType {
-    #[inline]
     pub fn from_bytes(bytes: u32) -> Self {
         Self::from_bits(bytes * 8)
     }
@@ -46,7 +46,7 @@ impl ToTokens for DataType {
 }
 
 pub fn read_write_field(
-    dim: bool,
+    is_array: bool,
     name: &str,
     read: Option<&Ident>,
     write: Option<&Ident>,
@@ -75,13 +75,12 @@ pub fn read_write_field(
         }
         output
     };
-    let dim = dim.then(|| quote! {_dim: usize});
+    let dim = is_array.then(|| quote! {_dim: usize});
     let value_type = DataType::from_bits(data.bits());
     if let Some(read) = read.as_ref() {
         let todo_msg = todo_msg(true);
         tokens.extend(quote! {
             #[doc = #doc]
-            #[inline]
             pub(crate) fn #read(&self, #dim) -> MemResult<#value_type> {
                 todo!(#todo_msg)
             }
@@ -92,10 +91,39 @@ pub fn read_write_field(
         let todo_msg = todo_msg(false);
         tokens.extend(quote! {
             #[doc = #doc]
-            #[inline]
             pub(crate) fn #write(&mut self, #(#dim,)* _value: #value_type) -> MemResult<()> {
                 todo!(#todo_msg)
             }
         });
     }
+}
+
+pub trait Dim {
+    fn array(&self) -> Option<&DimElement>;
+    fn is_one(&self) -> bool {
+        match self.array() {
+            Some(dim) => dim.dim == 1,
+            None => true,
+        }
+    }
+}
+
+impl<T> Dim for MaybeArray<T> {
+    fn array(&self) -> Option<&DimElement> {
+        match self {
+            MaybeArray::Single(_) => None,
+            MaybeArray::Array(_, dim) => Some(dim),
+        }
+    }
+}
+
+pub fn offsets_from_dim<'a>(
+    dim: &'a DimElement,
+) -> impl Iterator<Item = u32> + Clone + 'a {
+    let mut acc = 0;
+    (0..dim.dim).map(move |_i| {
+        let next = acc;
+        acc += dim.dim_increment;
+        next
+    })
 }

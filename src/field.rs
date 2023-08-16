@@ -1,9 +1,9 @@
 use anyhow::{bail, Result};
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, ToTokens};
-use svd_parser::svd::{Field, Name, Peripheral, Register};
+use svd_parser::svd::{Access, Field, Name, RegisterProperties};
 
-use crate::{formater::*, helper};
+use crate::{helper, memory::Context};
 
 /// Number of bits of the field, first byte bits, number of bytes and bits
 /// on the last byte
@@ -45,45 +45,47 @@ impl FieldData {
 
 #[derive(Debug)]
 pub struct FieldAccess<'a> {
-    pub offset: u32,
-    pub is_dim: bool,
+    pub is_array: bool,
     pub read: Option<Ident>,
     pub write: Option<Ident>,
     pub data: FieldData,
+    pub fields: Vec<&'a Field>,
     pub reset_value: u64,
     pub reset_mask: u64,
-    pub fields: Vec<(&'a Peripheral, &'a Register, &'a Field)>,
 }
 
 impl<'a> FieldAccess<'a> {
-    pub fn new(
-        fields: Vec<(&'a Peripheral, &'a Register, &'a Field)>,
-        offset: u32,
-        is_dim: bool,
-        per_name: &str,
-        clu_name: Option<&str>,
-        reg_name: &str,
-        default_rw: (bool, bool),
+    pub(crate) fn new(
+        context: &Context,
+        properties: &RegisterProperties,
+        fields: Vec<&'a Field>,
+        is_array: bool,
+        register_name: &str,
         reg_reset_value: u64,
         reg_reset_mask: u64,
     ) -> Result<Self> {
         // all fields names, used for error messages
         let field_names = || {
+            let register_name = register_name.to_lowercase();
             fields
                 .iter()
-                .map(|(per, reg, field)| -> String {
-                    format!("{}::{}::{}", per.name(), reg.name(), field.name())
+                .map(|field| -> String {
+                    let field_name = field.name().to_lowercase();
+                    context.gen_field_fun_name(&register_name, &field_name)
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
         };
         //TODO how to get the name?
-        let name = snake_case(&fields[0].2.name);
+        let name = context.gen_field_fun_name(
+            &register_name,
+            &fields[0].name().to_lowercase(),
+        );
         // all fields have the same offset and len
         // TODO check that all fields have the same len, the offset was checked
         // by register call
-        let width = fields[0].2.bit_width();
-        let first_byte_len = fields[0].2.bit_offset();
+        let width = fields[0].bit_width();
+        let first_byte_len = fields[0].bit_offset();
         let first_byte_len = match first_byte_len % 8 {
             0 => 0, // don't need align
             x => (8 - x).min(width),
@@ -97,51 +99,25 @@ impl<'a> FieldAccess<'a> {
         };
 
         // fields can't have more permissions then the regs that contains it
-        let rw = fields
-            .iter()
-            .filter_map(|(_per, reg, field)| {
-                field.access.or(reg.properties.access)
-            })
-            .map(|access| (access.can_read(), access.can_write()))
-            .reduce(|rw1, rw2| (rw1.0 | rw2.0, rw1.1 | rw2.1))
-            .unwrap_or(default_rw);
-        if default_rw != rw {
-            bail!("fields {} with diferent permissions", field_names(),)
+        let access = properties
+            .access
+            .into_iter()
+            .chain(fields.iter().filter_map(|field| field.access))
+            .reduce(combine_access)
+            .unwrap_or(Access::ReadWrite);
+        if matches!(properties.access, Some(reg_access) if reg_access != access)
+        {
+            bail!("fields {} with diferent permissions", field_names())
         }
 
-        let read = rw.0.then(|| {
-            if let Some(clu) = clu_name {
-                format_ident!(
-                    "read_{}_{}_{}_{}",
-                    per_name,
-                    clu,
-                    reg_name,
-                    &name
-                )
-            } else {
-                format_ident!("read_{}_{}_{}", per_name, reg_name, &name)
-            }
-        });
-        let write = rw.1.then(|| {
-            if let Some(clu) = clu_name {
-                format_ident!(
-                    "write_{}_{}_{}_{}",
-                    per_name,
-                    clu,
-                    reg_name,
-                    &name
-                )
-            } else {
-                format_ident!("write_{}_{}_{}", per_name, reg_name, &name)
-            }
-        });
+        let read = access.can_read().then(|| format_ident!("{}_read", name));
+        let write = access.can_write().then(|| format_ident!("{}_write", name));
 
         let bits = u64::MAX >> (u64::BITS - width);
-        let reset_value = (reg_reset_value >> fields[0].2.lsb()) & bits;
-        let reset_mask = (reg_reset_mask >> fields[0].2.lsb()) & bits;
+        let reset_value = (reg_reset_value >> fields[0].lsb()) & bits;
+        let reset_mask = (reg_reset_mask >> fields[0].lsb()) & bits;
         Ok(Self {
-            is_dim,
-            offset,
+            is_array,
             read,
             write,
             data,
@@ -156,11 +132,9 @@ impl ToTokens for FieldAccess<'_> {
         let docs: Vec<_> = self
             .fields
             .iter()
-            .filter_map(|(per, reg, field)| {
+            .filter_map(|field| {
                 Some(format!(
-                    "{} {} {}: {}",
-                    per.name(),
-                    reg.name(),
+                    "{}: {}",
                     field.name(),
                     field.description.as_ref()?,
                 ))
@@ -170,13 +144,11 @@ impl ToTokens for FieldAccess<'_> {
         let name: Vec<_> = self
             .fields
             .iter()
-            .map(|(per, reg, field)| {
-                format!("{} {} {}", per.name(), reg.name(), field.name())
-            })
+            .map(|field| format!("{}", field.name()))
             .collect();
         let name = name.join(", ");
         helper::read_write_field(
-            self.is_dim,
+            self.is_array,
             &name,
             self.read.as_ref(),
             self.write.as_ref(),
@@ -186,5 +158,21 @@ impl ToTokens for FieldAccess<'_> {
             &docs,
             tokens,
         );
+    }
+}
+
+fn combine_access(a: Access, b: Access) -> Access {
+    use Access::*;
+    match (a, b) {
+        (ReadWrite, _) | (_, ReadWrite) => ReadWrite,
+        (ReadOnly, WriteOnly) | (WriteOnly, ReadOnly) => ReadWrite,
+        (ReadWriteOnce, WriteOnly) | (WriteOnly, ReadWriteOnce) => ReadWrite,
+        (ReadWriteOnce, _) | (_, ReadWriteOnce) => ReadWriteOnce,
+        (ReadOnly, ReadOnly) => ReadOnly,
+        (WriteOnce, WriteOnce) => WriteOnce,
+        (WriteOnce, WriteOnly)
+        | (WriteOnly, WriteOnce)
+        | (WriteOnly, WriteOnly) => WriteOnly,
+        (ReadOnly, WriteOnce) | (WriteOnce, ReadOnly) => ReadWriteOnce,
     }
 }
