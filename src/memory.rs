@@ -336,7 +336,7 @@ impl<'a> MemoryChunks<MemoryThingFinal<'a>> {
             pheriperals_name: name,
             clusters: vec![],
         };
-        let chunks = chunks.finalize(&mut context)?;
+        let chunks = chunks.finalize(&mut context, device)?;
         Ok(chunks)
     }
 
@@ -377,11 +377,12 @@ impl<'a> MemoryChunks<MemoryThingCondensated<'a>> {
     pub(crate) fn finalize<'b>(
         self,
         context: &mut Context<'b>,
+        device: &'a Device,
     ) -> Result<MemoryChunks<MemoryThingFinal<'a>>> {
         let chunks = self
             .chunks
             .into_iter()
-            .map(|chunk| chunk.finalize(context))
+            .map(|chunk| chunk.finalize(context, device))
             .collect::<Result<_, _>>()?;
         Ok(MemoryChunks { chunks })
     }
@@ -391,11 +392,12 @@ impl<'a> MemoryChunk<MemoryThingCondensated<'a>> {
     fn finalize<'b>(
         self,
         context: &mut Context<'b>,
+        device: &'a Device,
     ) -> Result<MemoryChunk<MemoryThingFinal<'a>>> {
         let things = self
             .things
             .into_iter()
-            .map(|value| value.finalize(context))
+            .map(|value| value.finalize(context, device))
             .collect::<Result<_, _>>()?;
         Ok(MemoryChunk { things })
     }
@@ -405,15 +407,16 @@ impl<'a> MemoryThingCondensated<'a> {
     fn finalize<'b>(
         self,
         context: &mut Context<'b>,
+        device: &'a Device,
     ) -> Result<MemoryThingFinal<'a>> {
         match self {
             Self::Register {
                 properties,
                 registers,
-            } => RegisterAccess::new(context, properties, registers)
+            } => RegisterAccess::new(context, device, properties, registers)
                 .map(MemoryThingFinal::Register),
             Self::Cluster { clusters, memory } => {
-                ClusterAccess::new(context, clusters, memory)
+                ClusterAccess::new(context, device, clusters, memory)
                     .map(MemoryThingFinal::Cluster)
             }
         }

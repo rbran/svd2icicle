@@ -2,8 +2,8 @@ use anyhow::{bail, Result};
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, ToTokens};
 use svd_parser::svd::{
-    Access, Field, ModifiedWriteValues, Name, ReadAction, RegisterProperties,
-    WriteConstraint,
+    Access, Device, EnumeratedValues, Field, MaybeArray, ModifiedWriteValues,
+    Name, ReadAction, RegisterInfo, RegisterProperties, WriteConstraint,
 };
 
 use crate::{helper, memory::Context};
@@ -58,11 +58,13 @@ pub struct FieldAccess<'a> {
     pub modified_write_values: Option<ModifiedWriteValues>,
     pub write_constraint: Option<WriteConstraint>,
     pub read_action: Option<ReadAction>,
+    pub enumerated_values: Vec<EnumeratedValues>,
 }
 
 impl<'a> FieldAccess<'a> {
     pub(crate) fn new(
         context: &Context,
+        device: &'a Device,
         properties: &RegisterProperties,
         fields: Vec<&'a Field>,
         is_array: bool,
@@ -134,6 +136,26 @@ impl<'a> FieldAccess<'a> {
         let read_action = helper::combine_read_actions(
             fields.iter().filter_map(|field| field.read_action),
         )?;
+        let enumerated_values =
+            helper::combine_enumerate_value(fields.iter().flat_map(|field| {
+                field.enumerated_values.iter().map(|values| {
+                    if let Some(derived) = values.derived_from.as_ref() {
+                        device
+                            .peripherals
+                            .iter()
+                            .flat_map(|per| per.registers())
+                            .flat_map(|reg| reg.fields())
+                            .find_map(|field| {
+                                field.enumerated_values.iter().find(|values| {
+                                    values.name.as_ref() == Some(derived)
+                                })
+                            })
+                            .unwrap()
+                    } else {
+                        values
+                    }
+                })
+            }))?;
         Ok(Self {
             is_array,
             read,
@@ -145,6 +167,7 @@ impl<'a> FieldAccess<'a> {
             modified_write_values,
             write_constraint,
             read_action,
+            enumerated_values,
         })
     }
 }
@@ -180,6 +203,7 @@ impl ToTokens for FieldAccess<'_> {
             self.modified_write_values,
             self.write_constraint,
             self.read_action,
+            &self.enumerated_values,
             tokens,
         );
     }

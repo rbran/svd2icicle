@@ -5,7 +5,7 @@ use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::{
     ClusterInfo, DimElement, MaybeArray, ModifiedWriteValues, Name, ReadAction,
-    RegisterInfo, RegisterProperties, WriteConstraint,
+    RegisterInfo, RegisterProperties, WriteConstraint, Device,
 };
 
 use crate::field::{FieldAccess, FieldData};
@@ -25,6 +25,7 @@ pub struct ClusterAccess<'a> {
 impl<'a> ClusterAccess<'a> {
     pub(crate) fn new<'b>(
         context: &mut Context<'b>,
+        device: &'a Device,
         clusters: Vec<&'a MaybeArray<ClusterInfo>>,
         memory: MemoryChunks<MemoryThingCondensated<'a>>,
     ) -> Result<Self> {
@@ -39,7 +40,7 @@ impl<'a> ClusterAccess<'a> {
             .map(|cluster| dim_to_n(&cluster.name().to_lowercase()))
             .collect();
         context.clusters.push(cluster_name);
-        let memory = memory.finalize(context)?;
+        let memory = memory.finalize(context, device)?;
         context.clusters.pop();
         Ok(Self {
             clusters,
@@ -80,6 +81,7 @@ pub struct RegisterAccess<'a> {
 impl<'a> RegisterAccess<'a> {
     pub(crate) fn new(
         context: &Context,
+        device: &'a Device,
         properties: RegisterProperties,
         registers: Vec<&'a MaybeArray<RegisterInfo>>,
     ) -> Result<Self> {
@@ -142,6 +144,7 @@ impl<'a> RegisterAccess<'a> {
                 // TODO compare field access with register access
                 FieldAccess::new(
                     context,
+                    device,
                     &properties,
                     fields,
                     registers[0].is_array(),
@@ -236,6 +239,7 @@ impl<'a> RegisterAccess<'a> {
                 self.modified_write_values,
                 self.write_constraint,
                 self.read_action,
+                &[],
                 tokens,
             )
         }
