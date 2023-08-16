@@ -1,6 +1,9 @@
+use anyhow::{bail, Result};
 use proc_macro2::{Ident, TokenStream};
 use quote::{quote, ToTokens};
-use svd_parser::svd::{DimElement, MaybeArray};
+use svd_parser::svd::{
+    DimElement, MaybeArray, ModifiedWriteValues, ReadAction, WriteConstraint,
+};
 
 use crate::field::FieldData;
 
@@ -54,14 +57,16 @@ pub fn read_write_field(
     reset_value: u64,
     reset_mask: u64,
     doc: &str,
+    modified_write_values: Option<ModifiedWriteValues>,
+    write_constraint: Option<WriteConstraint>,
+    read_action: Option<ReadAction>,
     tokens: &mut TokenStream,
 ) {
     let todo_msg = |read| {
         use std::fmt::Write;
         let mut output = format!(
-            "{} {} reset value ",
+            "{} {name} mwrite {modified_write_values:?} write {write_constraint:?} rac {read_action:?} reset value ",
             if read { "read" } else { "write" },
-            name,
         );
         if data.bits() == 1 {
             if reset_value == 0 {
@@ -126,4 +131,55 @@ pub fn offsets_from_dim<'a>(
         acc += dim.dim_increment;
         next
     })
+}
+
+pub fn combine_modify_write_value(
+    modified_write_values: impl Iterator<Item = ModifiedWriteValues>,
+) -> Result<Option<ModifiedWriteValues>> {
+    let mut output = None;
+    for modify in modified_write_values {
+        //use ModifiedWriteValues::*;
+        match (output, modify) {
+            (None, new) => output = Some(new),
+            (Some(old), new) if old == new => {}
+            (Some(old), new) => {
+                bail!("can't combine modify write value {old:?} and {new:?}")
+            }
+        }
+    }
+    Ok(output)
+}
+
+pub fn combine_write_constraint(
+    modified_write_values: impl Iterator<Item = WriteConstraint>,
+) -> Result<Option<WriteConstraint>> {
+    let mut output = None;
+    for modify in modified_write_values {
+        //use ModifiedWriteValues::*;
+        match (output, modify) {
+            (None, new) => output = Some(new),
+            (Some(old), new) if old == new => {}
+            (Some(old), new) => {
+                bail!("can't combine write constraints {old:?} and {new:?}")
+            }
+        }
+    }
+    Ok(output)
+}
+
+pub fn combine_read_actions(
+    modified_write_values: impl Iterator<Item = ReadAction>,
+) -> Result<Option<ReadAction>> {
+    let mut output = None;
+    for modify in modified_write_values {
+        //use ModifiedWriteValues::*;
+        match (output, modify) {
+            (None, new) => output = Some(new),
+            (Some(old), new) if old == new => {}
+            (Some(old), new) => {
+                bail!("can't combine write constraints {old:?} and {new:?}")
+            }
+        }
+    }
+    Ok(output)
 }

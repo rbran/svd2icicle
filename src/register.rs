@@ -4,7 +4,8 @@ use anyhow::{bail, Result};
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::{
-    ClusterInfo, DimElement, MaybeArray, Name, RegisterInfo, RegisterProperties,
+    ClusterInfo, DimElement, MaybeArray, ModifiedWriteValues, Name, ReadAction,
+    RegisterInfo, RegisterProperties, WriteConstraint,
 };
 
 use crate::field::{FieldAccess, FieldData};
@@ -71,6 +72,9 @@ pub struct RegisterAccess<'a> {
     pub properties: RegisterProperties,
     /// reset value, except for the fields (0s in there)
     pub clean_value: u64,
+    pub modified_write_values: Option<ModifiedWriteValues>,
+    pub write_constraint: Option<WriteConstraint>,
+    pub read_action: Option<ReadAction>,
 }
 
 impl<'a> RegisterAccess<'a> {
@@ -162,6 +166,20 @@ impl<'a> RegisterAccess<'a> {
                     clean & !mask
                 });
 
+        let modified_write_values = helper::combine_modify_write_value(
+            registers
+                .iter()
+                .filter_map(|register| register.modified_write_values),
+        )?;
+        let write_constraint = helper::combine_write_constraint(
+            registers
+                .iter()
+                .filter_map(|register| register.write_constraint),
+        )?;
+        let read_action = helper::combine_read_actions(
+            registers.iter().filter_map(|register| register.read_action),
+        )?;
+
         Ok(Self {
             read_fun,
             write_fun,
@@ -169,6 +187,9 @@ impl<'a> RegisterAccess<'a> {
             fields,
             clean_value,
             properties,
+            modified_write_values,
+            write_constraint,
+            read_action,
         })
     }
 
@@ -212,6 +233,9 @@ impl<'a> RegisterAccess<'a> {
                 self.properties.reset_value.unwrap_or(0),
                 self.properties.reset_mask.unwrap_or(0),
                 &docs,
+                self.modified_write_values,
+                self.write_constraint,
+                self.read_action,
                 tokens,
             )
         }

@@ -1,7 +1,10 @@
 use anyhow::{bail, Result};
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, ToTokens};
-use svd_parser::svd::{Access, Field, Name, RegisterProperties};
+use svd_parser::svd::{
+    Access, Field, ModifiedWriteValues, Name, ReadAction, RegisterProperties,
+    WriteConstraint,
+};
 
 use crate::{helper, memory::Context};
 
@@ -52,6 +55,9 @@ pub struct FieldAccess<'a> {
     pub fields: Vec<&'a Field>,
     pub reset_value: u64,
     pub reset_mask: u64,
+    pub modified_write_values: Option<ModifiedWriteValues>,
+    pub write_constraint: Option<WriteConstraint>,
+    pub read_action: Option<ReadAction>,
 }
 
 impl<'a> FieldAccess<'a> {
@@ -116,6 +122,18 @@ impl<'a> FieldAccess<'a> {
         let bits = u64::MAX >> (u64::BITS - width);
         let reset_value = (reg_reset_value >> fields[0].lsb()) & bits;
         let reset_mask = (reg_reset_mask >> fields[0].lsb()) & bits;
+
+        let modified_write_values = helper::combine_modify_write_value(
+            fields
+                .iter()
+                .filter_map(|field| field.modified_write_values),
+        )?;
+        let write_constraint = helper::combine_write_constraint(
+            fields.iter().filter_map(|field| field.write_constraint),
+        )?;
+        let read_action = helper::combine_read_actions(
+            fields.iter().filter_map(|field| field.read_action),
+        )?;
         Ok(Self {
             is_array,
             read,
@@ -124,6 +142,9 @@ impl<'a> FieldAccess<'a> {
             fields,
             reset_value,
             reset_mask,
+            modified_write_values,
+            write_constraint,
+            read_action,
         })
     }
 }
@@ -156,6 +177,9 @@ impl ToTokens for FieldAccess<'_> {
             self.reset_value,
             self.reset_mask,
             &docs,
+            self.modified_write_values,
+            self.write_constraint,
+            self.read_action,
             tokens,
         );
     }
