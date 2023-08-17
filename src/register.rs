@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use anyhow::{bail, Result};
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::{
@@ -28,7 +27,7 @@ impl<'a> ClusterAccess<'a> {
         device: &'a Device,
         clusters: Vec<&'a MaybeArray<ClusterInfo>>,
         memory: MemoryChunks<MemoryThingCondensated<'a>>,
-    ) -> Result<Self> {
+    ) -> Self {
         // generate the names
         let mut bytes = memory.len();
         if let Some(dim) = clusters[0].array() {
@@ -40,13 +39,13 @@ impl<'a> ClusterAccess<'a> {
             .map(|cluster| dim_to_n(&cluster.name().to_lowercase()))
             .collect();
         context.clusters.push(cluster_name);
-        let memory = memory.finalize(context, device)?;
+        let memory = memory.finalize(context, device);
         context.clusters.pop();
-        Ok(Self {
+        Self {
             clusters,
             bytes,
             memory,
-        })
+        }
     }
 
     pub(crate) fn gen_register_functions(
@@ -84,7 +83,7 @@ impl<'a> RegisterAccess<'a> {
         device: &'a Device,
         properties: RegisterProperties,
         registers: Vec<&'a MaybeArray<RegisterInfo>>,
-    ) -> Result<Self> {
+    ) -> Self {
         // all register names, used for error messages
         let regs_names = || {
             format!(
@@ -125,7 +124,7 @@ impl<'a> RegisterAccess<'a> {
         if reset_value_mask_iter
             .any(|other_reset| other_reset != (reset_value, reset_mask))
         {
-            bail!(
+            panic!(
                 "overlapping registers {} with diferent reset value/mask",
                 regs_names(),
             )
@@ -153,7 +152,7 @@ impl<'a> RegisterAccess<'a> {
                     reset_mask,
                 )
             })
-            .collect::<Result<_, _>>()?;
+            .collect();
         fields.sort_unstable_by_key(|field| field.fields[0].bit_offset());
 
         // TODO check for overlapping fields
@@ -173,17 +172,17 @@ impl<'a> RegisterAccess<'a> {
             registers
                 .iter()
                 .filter_map(|register| register.modified_write_values),
-        )?;
+        );
         let write_constraint = helper::combine_write_constraint(
             registers
                 .iter()
                 .filter_map(|register| register.write_constraint),
-        )?;
+        );
         let read_action = helper::combine_read_actions(
             registers.iter().filter_map(|register| register.read_action),
-        )?;
+        );
 
-        Ok(Self {
+        Self {
             read_fun,
             write_fun,
             registers,
@@ -193,7 +192,7 @@ impl<'a> RegisterAccess<'a> {
             modified_write_values,
             write_constraint,
             read_action,
-        })
+        }
     }
 
     pub fn implicit_field(&self) -> bool {

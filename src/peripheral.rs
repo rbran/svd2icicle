@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use anyhow::{bail, Result};
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::{Device, MaybeArray, Name, PeripheralInfo};
@@ -13,11 +12,10 @@ use crate::{ADDR_BITS, ADDR_MASK, PAGE_LEN, PAGE_MASK};
 pub struct Peripherals<'a> {
     pub svds: &'a [Device],
     pub pages: Vec<PeripheralPage<'a>>,
-    //pub registers: Vec<RegisterAccess<'a>>,
 }
 
 impl<'a> Peripherals<'a> {
-    pub fn new(svds: &'a [Device]) -> Result<Self> {
+    pub fn new(svds: &'a [Device]) -> Self {
         let mut peripherals: HashMap<u64, (_, Vec<_>)> = HashMap::new();
         for svd in svds {
             for per in svd.peripherals.iter() {
@@ -39,15 +37,15 @@ impl<'a> Peripherals<'a> {
         });
         let pages: Vec<_> = pages
             .into_iter()
-            .map(|(svd, pers)| Ok(PeripheralPage::new(svd, pers)?))
-            .collect::<Result<_, anyhow::Error>>()?;
+            .map(|(svd, pers)| PeripheralPage::new(svd, pers))
+            .collect();
 
         //let memory = memory::pages_from_chunks(ADDR_BITS, &registers);
-        Ok(Self {
+        Self {
             //memory,
             svds,
             pages,
-        })
+        }
     }
 
     #[allow(dead_code)]
@@ -142,7 +140,7 @@ impl<'a> PeripheralPage<'a> {
     fn new(
         device: &'a Device,
         peripherals: Vec<&'a MaybeArray<PeripheralInfo>>,
-    ) -> Result<Self> {
+    ) -> Self {
         // peripherals can't be bigger then a page
         if matches!(peripherals
             .iter()
@@ -150,13 +148,13 @@ impl<'a> PeripheralPage<'a> {
             .map(|dim| dim.dim_increment)
             .max(), Some(len) if len != PAGE_LEN as u32)
         {
-            bail!("Peripheral with invalid len");
+            panic!("Peripheral with invalid len");
         }
 
         // if one is dim, all need to be dim and equal
         let first = peripherals[0].array();
         if peripherals[1..].iter().any(|per| per.array() != first) {
-            bail!("Invalid Peripheral dim");
+            panic!("Invalid Peripheral dim");
         }
 
         // TODO other verifications...
@@ -187,19 +185,19 @@ impl<'a> PeripheralPage<'a> {
         let peripheral_struct = format_ident!("{}", &camel_case_name);
         let field_name = format_ident!("{}", &snake_case_name);
 
-        let chunks = MemoryChunks::new_page(device, &raw_name, &peripherals)?;
+        let chunks = MemoryChunks::new_page(device, &raw_name, &peripherals);
         if chunks.len() > PAGE_LEN {
-            bail!("Peripheral with size bigger then a page");
+            panic!("Peripheral with size bigger then a page");
         }
 
-        Ok(Self {
+        Self {
             pseudo_struct,
             mod_name,
             peripheral_struct,
             field_name,
             peripherals,
             chunks,
-        })
+        }
     }
 
     pub fn page_addr(&self) -> u64 {

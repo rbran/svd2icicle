@@ -100,7 +100,6 @@ dependencies = [
 name = "svd2icicle"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "proc-macro2",
  "quote",
  "svd-parser",

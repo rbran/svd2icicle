@@ -1,4 +1,3 @@
-use anyhow::{bail, Result};
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, ToTokens};
 use svd_parser::svd::{
@@ -71,7 +70,7 @@ impl<'a> FieldAccess<'a> {
         register_name: &str,
         reg_reset_value: u64,
         reg_reset_mask: u64,
-    ) -> Result<Self> {
+    ) -> Self {
         // all fields names, used for error messages
         let field_names = || {
             let register_name = register_name.to_lowercase();
@@ -115,7 +114,7 @@ impl<'a> FieldAccess<'a> {
             .unwrap_or(Access::ReadWrite);
         if matches!(properties.access, Some(reg_access) if reg_access != access)
         {
-            bail!("fields {} with diferent permissions", field_names())
+            panic!("fields {} with diferent permissions", field_names())
         }
 
         let read = access.can_read().then(|| format_ident!("{}_read", name));
@@ -129,13 +128,13 @@ impl<'a> FieldAccess<'a> {
             fields
                 .iter()
                 .filter_map(|field| field.modified_write_values),
-        )?;
+        );
         let write_constraint = helper::combine_write_constraint(
             fields.iter().filter_map(|field| field.write_constraint),
-        )?;
+        );
         let read_action = helper::combine_read_actions(
             fields.iter().filter_map(|field| field.read_action),
-        )?;
+        );
         let enumerated_values =
             helper::combine_enumerate_value(fields.iter().flat_map(|field| {
                 field.enumerated_values.iter().map(|values| {
@@ -155,8 +154,8 @@ impl<'a> FieldAccess<'a> {
                         values
                     }
                 })
-            }))?;
-        Ok(Self {
+            }));
+        Self {
             is_array,
             read,
             write,
@@ -168,7 +167,7 @@ impl<'a> FieldAccess<'a> {
             write_constraint,
             read_action,
             enumerated_values,
-        })
+        }
     }
 }
 impl ToTokens for FieldAccess<'_> {

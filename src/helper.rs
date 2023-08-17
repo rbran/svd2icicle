@@ -1,4 +1,3 @@
-use anyhow::{bail, Result};
 use proc_macro2::{Ident, TokenStream};
 use quote::{quote, ToTokens};
 use svd_parser::svd::{
@@ -61,7 +60,7 @@ pub fn read_write_field(
     modified_write_values: Option<ModifiedWriteValues>,
     write_constraint: Option<WriteConstraint>,
     read_action: Option<ReadAction>,
-    enumerate_values: &[EnumeratedValues],
+    _enumerate_values: &[EnumeratedValues],
     tokens: &mut TokenStream,
 ) {
     let todo_msg = |read| {
@@ -137,39 +136,37 @@ pub fn offsets_from_dim<'a>(
 
 fn stuff_need_to_be_equal<S: Eq + core::fmt::Debug>(
     mut stuff_iter: impl Iterator<Item = S>,
-) -> Result<Option<S>> {
-    let Some(output) = stuff_iter.next() else {
-        return Ok(None)
-    };
+) -> Option<S> {
+    let output = stuff_iter.next()?;
     for stuff in stuff_iter {
         if output != stuff {
-            bail!("can't combine {output:?} and {stuff:?}")
+            panic!("can't combine {output:?} and {stuff:?}")
         }
     }
-    Ok(Some(output))
+    Some(output)
 }
 
 pub fn combine_modify_write_value(
     iter: impl Iterator<Item = ModifiedWriteValues>,
-) -> Result<Option<ModifiedWriteValues>> {
+) -> Option<ModifiedWriteValues> {
     stuff_need_to_be_equal(iter)
 }
 
 pub fn combine_write_constraint(
     iter: impl Iterator<Item = WriteConstraint>,
-) -> Result<Option<WriteConstraint>> {
+) -> Option<WriteConstraint> {
     stuff_need_to_be_equal(iter)
 }
 
 pub fn combine_read_actions(
     iter: impl Iterator<Item = ReadAction>,
-) -> Result<Option<ReadAction>> {
+) -> Option<ReadAction> {
     stuff_need_to_be_equal(iter)
 }
 
 pub fn combine_enumerate_value<'a>(
     iter: impl Iterator<Item = &'a EnumeratedValues>,
-) -> Result<Vec<EnumeratedValues>> {
+) -> Vec<EnumeratedValues> {
     let mut output: Vec<EnumeratedValues> = vec![];
     for values in iter {
         if values.derived_from.is_some() {
@@ -186,5 +183,5 @@ pub fn combine_enumerate_value<'a>(
         }
     }
     // TODO check of redundant usages?
-    Ok(output)
+    output
 }

@@ -14,8 +14,7 @@ fn main() {
     gen_empty_implementation(
         &svds,
         Path::new("/home/rbran/src/icicle-nrf52832/src/lib.rs"),
-    )
-    .unwrap();
+    );
     assert_eq!(
         std::process::Command::new("rustfmt")
             .arg("/home/rbran/src/icicle-nrf52832/src/lib.rs")
