@@ -4,6 +4,7 @@ use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::{Device, MaybeArray, Name, PeripheralInfo};
 
+use crate::enumeration::Enumeration;
 use crate::formater::{camel_case, dim_to_n, snake_case};
 use crate::helper::Dim;
 use crate::memory::{Memory, MemoryChunks, MemoryThingFinal};
@@ -12,49 +13,20 @@ use crate::{ADDR_BITS, ADDR_MASK, PAGE_LEN, PAGE_MASK};
 pub struct Peripherals<'a> {
     pub svds: &'a [Device],
     pub pages: Vec<PeripheralPage<'a>>,
+    pub enumerations: Vec<Enumeration<'a>>,
 }
 
 impl<'a> Peripherals<'a> {
     pub fn new(svds: &'a [Device]) -> Self {
-        let mut peripherals: HashMap<u64, (_, Vec<_>)> = HashMap::new();
-        for svd in svds {
-            for per in svd.peripherals.iter() {
-                let page = per.base_address & PAGE_MASK;
-                peripherals.entry(page).or_insert((svd, vec![])).1.push(per);
-            }
-        }
-        // TODO improve this, consume the peripherals HashMap -> Vec -> Vec
-        // could be avoided. This is here so we can be sure the errors in
-        // PeripheralPage errors happen are reproducible. The problem is that
-        // consuming directly from the HashMap return elements in a random
-        // order.
-        let mut pages: Vec<(&Device, Vec<_>)> = peripherals
-            .into_iter()
-            .map(|(_page, (svd, pers))| (svd, pers))
-            .collect();
-        pages.sort_unstable_by_key(|(_svd, pers)| {
-            pers[0].base_address & PAGE_MASK
-        });
-        let pages: Vec<_> = pages
-            .into_iter()
-            .map(|(svd, pers)| PeripheralPage::new(svd, pers))
-            .collect();
-
-        //let memory = memory::pages_from_chunks(ADDR_BITS, &registers);
+        let enumerations = Enumeration::combine_all(svds);
+        let pages = PeripheralPage::combine_all(svds, &enumerations);
         Self {
-            //memory,
             svds,
             pages,
+            enumerations,
         }
     }
 
-    #[allow(dead_code)]
-    pub fn gen_all_but_peripherals(&self, tokens: &mut TokenStream) {
-        self.gen_pages(tokens);
-        self.gen_map_pages(tokens);
-    }
-
-    #[allow(dead_code)]
     pub fn gen_all(&self, tokens: &mut TokenStream) {
         self.gen_peripheral(tokens);
         self.gen_pages(tokens);
@@ -70,11 +42,14 @@ impl<'a> Peripherals<'a> {
         // register function that could be overwriten by the user
         let register_functions =
             self.pages.iter().map(PeripheralPage::gen_register_fun);
-        //// the register/fields read/write functions
-        //let regs_funs = self.pages.iter().map(Peripherals::fields_functions);
+        // all enums used by fields/registers
+        let enums_declare = self.enumerations.iter().map(Enumeration::gen_enum);
         // all the memory blocks
         tokens.extend(quote! {
             pub mod peripheral {
+                pub mod enums {
+                    #(#enums_declare)*
+                }
                 #(#per_structs)*
                 #[derive(Default)]
                 pub struct Peripherals {
@@ -137,6 +112,34 @@ pub struct PeripheralPage<'a> {
 }
 
 impl<'a> PeripheralPage<'a> {
+    fn combine_all(
+        svds: &'a [Device],
+        _enumerations: &[Enumeration<'a>],
+    ) -> Vec<Self> {
+        let mut peripherals: HashMap<u64, (_, Vec<_>)> = HashMap::new();
+        for svd in svds {
+            for per in svd.peripherals.iter() {
+                let page = per.base_address & PAGE_MASK;
+                peripherals.entry(page).or_insert((svd, vec![])).1.push(per);
+            }
+        }
+        // TODO improve this, consume the peripherals HashMap -> Vec -> Vec
+        // could be avoided. This is here so we can be sure the errors in
+        // PeripheralPage errors happen are reproducible. The problem is that
+        // consuming directly from the HashMap return elements in a random
+        // order.
+        let mut pages: Vec<(&Device, Vec<_>)> = peripherals
+            .into_iter()
+            .map(|(_page, (svd, pers))| (svd, pers))
+            .collect();
+        pages.sort_unstable_by_key(|(_svd, pers)| {
+            pers[0].base_address & PAGE_MASK
+        });
+        pages
+            .into_iter()
+            .map(|(svd, pers)| PeripheralPage::new(svd, pers))
+            .collect()
+    }
     fn new(
         device: &'a Device,
         peripherals: Vec<&'a MaybeArray<PeripheralInfo>>,
