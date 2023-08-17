@@ -161,21 +161,33 @@ impl<'a> PeripheralPage<'a> {
 
         // TODO other verifications...
 
-        let mut name = String::new();
-        let mut snake_case_name = String::new();
-        let mut camel_case_name = String::new();
-        for per in peripherals.iter() {
-            let raw_name = dim_to_n(per.name());
-            name.push_str(&raw_name);
-            snake_case_name.push_str(&snake_case(&raw_name));
-            camel_case_name.push_str(&camel_case(&raw_name));
-        }
+        let raw_name = if peripherals.len() == 1 {
+            dim_to_n(peripherals[0].name())
+        } else {
+            let page = (peripherals[0].base_address & PAGE_MASK) >> ADDR_BITS;
+            match page {
+                0x1000_0 => "ficr".to_owned(),
+                0x1000_1..=0x1FFF_F => format!("uicr{}", page - 0x1000_1),
+                0x4000_0..=0x4FFF_F => format!("apb{}", page - 0x4000_0),
+                0x5000_0..=0x6FFF_F => format!("ahb{}", page - 0x5000_0),
+                0xE000_0 => "itm".to_owned(),
+                0xE000_1 => "dwt".to_owned(),
+                0xE000_2 => "fpb".to_owned(),
+                0xE000_E => "scs".to_owned(),
+                0xE004_0 => "tpiu".to_owned(),
+                0xE004_1 => "etm".to_owned(),
+                0xE004_2..=0xE0FE_F => format!("eppb{}", page - 0xE004_2),
+                _ => format!("unknown0x{page:x}"),
+            }
+        };
+        let snake_case_name = snake_case(&raw_name);
+        let camel_case_name = camel_case(&raw_name);
         let pseudo_struct = format_ident!("PeripheralPage{}", &camel_case_name);
         let mod_name = format_ident!("{}", &snake_case_name);
         let peripheral_struct = format_ident!("{}", &camel_case_name);
         let field_name = format_ident!("{}", &snake_case_name);
 
-        let chunks = MemoryChunks::new_page(device, &name, &peripherals)?;
+        let chunks = MemoryChunks::new_page(device, &raw_name, &peripherals)?;
         if chunks.len() > PAGE_LEN {
             bail!("Peripheral with size bigger then a page");
         }

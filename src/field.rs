@@ -2,8 +2,8 @@ use anyhow::{bail, Result};
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, ToTokens};
 use svd_parser::svd::{
-    Access, Device, EnumeratedValues, Field, MaybeArray, ModifiedWriteValues,
-    Name, ReadAction, RegisterInfo, RegisterProperties, WriteConstraint,
+    Access, Device, EnumeratedValues, Field, ModifiedWriteValues, Name,
+    ReadAction, RegisterProperties, WriteConstraint,
 };
 
 use crate::{helper, memory::Context};

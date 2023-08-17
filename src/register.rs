@@ -4,8 +4,8 @@ use anyhow::{bail, Result};
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::{
-    ClusterInfo, DimElement, MaybeArray, ModifiedWriteValues, Name, ReadAction,
-    RegisterInfo, RegisterProperties, WriteConstraint, Device,
+    ClusterInfo, Device, DimElement, MaybeArray, ModifiedWriteValues, Name,
+    ReadAction, RegisterInfo, RegisterProperties, WriteConstraint,
 };
 
 use crate::field::{FieldAccess, FieldData};

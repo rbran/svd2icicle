@@ -67,7 +67,7 @@ pub fn read_write_field(
     let todo_msg = |read| {
         use std::fmt::Write;
         let mut output = format!(
-            "{} {name} mwrite {modified_write_values:?} write {write_constraint:?} rac {read_action:?} reset value\nvalues: {enumerate_values:#?}\n",
+            "{} {name} mwrite {modified_write_values:?} write {write_constraint:?} rac {read_action:?} reset value",
             if read { "read" } else { "write" },
         );
         if data.bits() == 1 {
@@ -185,5 +185,6 @@ pub fn combine_enumerate_value<'a>(
             output.push(values.clone())
         }
     }
+    // TODO check of redundant usages?
     Ok(output)
 }
