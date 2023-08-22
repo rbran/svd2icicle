@@ -3,12 +3,14 @@ use std::ops::Range;
 use proc_macro2::{Literal, TokenStream};
 use quote::quote;
 use svd_parser::svd::{
-    ClusterInfo, Device, DimElement, MaybeArray, Name, PeripheralInfo,
-    RegisterInfo, RegisterProperties,
+    self, ClusterInfo, DimElement, MaybeArray, Name, RegisterInfo,
+    RegisterProperties,
 };
 
+use crate::enumeration::EnumerationValues;
+use crate::formater::dim_to_n;
 use crate::helper::Dim;
-use crate::peripheral::PeripheralPage;
+use crate::peripheral::ContextCodeGen;
 use crate::register::{ClusterAccess, RegisterAccess};
 use crate::PAGE_LEN;
 
@@ -25,10 +27,7 @@ pub trait Memory {
     }
 }
 
-pub trait MemoryThing: Memory {
-    //fn properties(&self) -> &RegisterProperties;
-    fn array(&self) -> Option<&DimElement>;
-}
+pub trait MemoryThing: Memory + Dim {}
 
 /// default implementation for Memory len for MemoryThing
 fn memory_thing_len(mem: &impl MemoryThing, mut len: u64) -> u64 {
@@ -43,10 +42,15 @@ pub struct MemoryChunks<T> {
     chunks: Vec<MemoryChunk<T>>,
 }
 
-impl<T> Clone for MemoryChunks<T>
-where
-    T: Clone,
-{
+impl<T> Default for MemoryChunks<T> {
+    fn default() -> Self {
+        Self {
+            chunks: Default::default(),
+        }
+    }
+}
+
+impl<T: Clone> Clone for MemoryChunks<T> {
     fn clone(&self) -> Self {
         Self {
             chunks: self.chunks.clone(),
@@ -59,10 +63,15 @@ pub struct MemoryChunk<T> {
     things: Vec<T>,
 }
 
-impl<T> Clone for MemoryChunk<T>
-where
-    T: Clone,
-{
+impl<T> Default for MemoryChunk<T> {
+    fn default() -> Self {
+        Self {
+            things: Default::default(),
+        }
+    }
+}
+
+impl<T: Clone> Clone for MemoryChunk<T> {
     fn clone(&self) -> Self {
         Self {
             things: self.things.clone(),
@@ -94,19 +103,22 @@ pub(crate) enum MemoryThingCondensated<'a> {
     },
 }
 
-pub enum MemoryThingFinal<'a> {
-    Register(RegisterAccess<'a>),
-    Cluster(ClusterAccess<'a>),
+#[derive(Debug)]
+pub enum MemoryThingFinal {
+    Register(RegisterAccess),
+    Cluster(ClusterAccess),
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct Context<'a> {
+#[derive(Debug)]
+pub(crate) struct ContextMemoryGen<'a, 'b> {
+    pub svds: &'a [svd::Device],
+    pub enumerated_values: &'b mut Vec<EnumerationValues>,
     //pheriperals: &'b [&'a MaybeArray<PeripheralInfo>],
-    pub pheriperals_name: &'a str,
-    pub clusters: Vec<String>,
+    pub pheriperals_name: &'b str,
+    pub clusters: Vec<Vec<&'a MaybeArray<ClusterInfo>>>,
 }
 
-impl Memory for MemoryThingFinal<'_> {
+impl Memory for MemoryThingFinal {
     fn len(&self) -> u64 {
         let bytes = match self {
             Self::Register(reg) => reg.properties.size.unwrap() as u64 / 8,
@@ -117,8 +129,8 @@ impl Memory for MemoryThingFinal<'_> {
 
     fn offset(&self) -> u64 {
         match self {
-            Self::Register(reg) => reg.registers[0].address_offset as u64,
-            Self::Cluster(clu) => clu.clusters[0].address_offset as u64,
+            Self::Register(reg) => reg.address_offset as u64,
+            Self::Cluster(clu) => clu.address_offset as u64,
         }
     }
 
@@ -141,14 +153,16 @@ impl Memory for MemoryThingFinal<'_> {
     }
 }
 
-impl MemoryThing for MemoryThingFinal<'_> {
+impl Dim for MemoryThingFinal {
     fn array(&self) -> Option<&DimElement> {
         match self {
-            Self::Register(reg) => reg.registers[0].array(),
-            Self::Cluster(clu) => clu.clusters[0].array(),
+            Self::Register(reg) => reg.array.as_ref(),
+            Self::Cluster(clu) => clu.dim.as_ref().map(|x| &x.1),
         }
     }
 }
+
+impl MemoryThing for MemoryThingFinal {}
 
 impl core::fmt::Debug for MemoryThingCondensated<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -210,7 +224,7 @@ impl<T: Memory> Memory for MemoryChunk<T> {
     }
 }
 
-impl MemoryThing for MemoryThingSingle<'_> {
+impl Dim for MemoryThingSingle<'_> {
     fn array(&self) -> Option<&DimElement> {
         match self {
             Self::Register { register, .. } => register.array(),
@@ -218,6 +232,7 @@ impl MemoryThing for MemoryThingSingle<'_> {
         }
     }
 }
+impl MemoryThing for MemoryThingSingle<'_> {}
 
 impl Memory for MemoryThingSingle<'_> {
     fn len(&self) -> u64 {
@@ -245,7 +260,7 @@ impl Memory for MemoryThingSingle<'_> {
     }
 }
 
-impl MemoryThing for MemoryThingCondensated<'_> {
+impl Dim for MemoryThingCondensated<'_> {
     fn array(&self) -> Option<&DimElement> {
         match self {
             Self::Register { registers, .. } => registers[0].array(),
@@ -253,6 +268,7 @@ impl MemoryThing for MemoryThingCondensated<'_> {
         }
     }
 }
+impl MemoryThing for MemoryThingCondensated<'_> {}
 
 impl Memory for MemoryThingCondensated<'_> {
     fn len(&self) -> u64 {
@@ -303,19 +319,15 @@ impl<'a> From<MemoryThingSingle<'a>> for MemoryThingCondensated<'a> {
     }
 }
 
-impl<'a> MemoryChunks<MemoryThingFinal<'a>> {
-    pub fn new_page(
-        device: &'a Device,
-        name: &str,
-        peripherals: &[&'a MaybeArray<PeripheralInfo>],
+impl MemoryChunks<MemoryThingFinal> {
+    pub(crate) fn new_page<'a>(
+        context: &mut ContextMemoryGen<'a, '_>,
+        peripherals: &[&'a svd::Peripheral],
     ) -> Self {
         let things = peripherals
             .iter()
             .flat_map(|peripheral| {
-                let mut peripheral = *peripheral;
-                if let Some(derived) = &peripheral.derived_from {
-                    peripheral = device.get_peripheral(derived).unwrap();
-                }
+                assert!(peripheral.derived_from.is_none());
                 // combine the defaults of the cluster with the parent
                 let defaults = &peripheral.default_register_properties;
                 // the base address is with the page as offset
@@ -330,22 +342,17 @@ impl<'a> MemoryChunks<MemoryThingFinal<'a>> {
         if chunks.len() > PAGE_LEN {
             panic!("Pheripheral Page is bigger then the page");
         }
-        let mut context = Context {
-            //pheriperals,
-            pheriperals_name: name,
-            clusters: vec![],
-        };
-        let chunks = chunks.finalize(&mut context, device);
+        let chunks = chunks.finalize(context);
         chunks
     }
 
-    pub(crate) fn gen_fields_functions(
-        &self,
-        peripheral: &PeripheralPage,
+    pub(crate) fn gen_fields_functions<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
     ) -> TokenStream {
         self.chunks
             .iter()
-            .map(|chunk| chunk.gen_fields_functions(peripheral))
+            .map(|chunk| chunk.gen_fields_functions(context))
             .collect()
     }
 }
@@ -375,13 +382,12 @@ impl<'a> MemoryChunks<MemoryThingCondensated<'a>> {
 impl<'a> MemoryChunks<MemoryThingCondensated<'a>> {
     pub(crate) fn finalize<'b>(
         self,
-        context: &mut Context<'b>,
-        device: &'a Device,
-    ) -> MemoryChunks<MemoryThingFinal<'a>> {
+        context: &mut ContextMemoryGen<'a, 'b>,
+    ) -> MemoryChunks<MemoryThingFinal> {
         let chunks = self
             .chunks
             .into_iter()
-            .map(|chunk| chunk.finalize(context, device))
+            .map(|chunk| chunk.finalize(context))
             .collect();
         MemoryChunks { chunks }
     }
@@ -390,13 +396,12 @@ impl<'a> MemoryChunks<MemoryThingCondensated<'a>> {
 impl<'a> MemoryChunk<MemoryThingCondensated<'a>> {
     fn finalize<'b>(
         self,
-        context: &mut Context<'b>,
-        device: &'a Device,
-    ) -> MemoryChunk<MemoryThingFinal<'a>> {
+        context: &mut ContextMemoryGen<'a, 'b>,
+    ) -> MemoryChunk<MemoryThingFinal> {
         let things = self
             .things
             .into_iter()
-            .map(|value| value.finalize(context, device))
+            .map(|value| value.finalize(context))
             .collect();
         MemoryChunk { things }
     }
@@ -405,18 +410,17 @@ impl<'a> MemoryChunk<MemoryThingCondensated<'a>> {
 impl<'a> MemoryThingCondensated<'a> {
     fn finalize<'b>(
         self,
-        context: &mut Context<'b>,
-        device: &'a Device,
-    ) -> MemoryThingFinal<'a> {
+        context: &mut ContextMemoryGen<'a, 'b>,
+    ) -> MemoryThingFinal {
         match self {
             Self::Register {
                 properties,
                 registers,
             } => MemoryThingFinal::Register(RegisterAccess::new(
-                context, device, properties, registers,
+                context, properties, registers,
             )),
             Self::Cluster { clusters, memory } => MemoryThingFinal::Cluster(
-                ClusterAccess::new(context, device, clusters, memory),
+                ClusterAccess::new(context, clusters, memory),
             ),
         }
     }
@@ -721,59 +725,92 @@ fn cluster_chunks<'a>(
     mem
 }
 
-impl Context<'_> {
+impl ContextMemoryGen<'_, '_> {
+    fn clusters_name(&self) -> impl Iterator<Item = &str> {
+        self.clusters.iter().map(|clusters| clusters[0].name())
+    }
+    fn clusters(&self) -> String {
+        self.clusters_name()
+            .map(|name| dim_to_n(&name.to_lowercase()))
+            .zip(std::iter::repeat('_'.to_string()))
+            .flat_map(|(c, s)| [s, c].into_iter())
+            .collect()
+    }
     pub fn gen_register_fun_name(&self, name: &str) -> String {
-        let mut final_name = self.pheriperals_name.to_lowercase();
-        let clusters = self.clusters.iter().map(String::as_str);
-        let name = [name];
-        for name in clusters.chain(name) {
-            final_name.push('_');
-            final_name.push_str(name);
-        }
-        final_name
+        format!(
+            "{}{}_{}",
+            self.pheriperals_name.to_lowercase(),
+            self.clusters(),
+            name
+        )
     }
 
     pub fn gen_field_fun_name(&self, register: &str, field: &str) -> String {
-        let mut final_name = self.pheriperals_name.to_lowercase();
-        let clusters = self.clusters.iter().map(String::as_str);
-        let name = [register, field];
-        for name in clusters.chain(name) {
-            final_name.push('_');
-            final_name.push_str(name);
-        }
-        final_name
+        format!(
+            "{}{}_{}_{}",
+            self.pheriperals_name.to_lowercase(),
+            self.clusters(),
+            register,
+            field
+        )
+    }
+    pub fn gen_location(&self) -> String {
+        let per = self.pheriperals_name;
+        let clusters = self.clusters_name().collect::<Vec<_>>().join(", ");
+        format!("{per} {clusters}")
     }
 }
 
-impl MemoryChunks<MemoryThingFinal<'_>> {
-    pub fn gen_match_chunks(&self, read: bool, offset: u64) -> TokenStream {
+impl MemoryChunks<MemoryThingFinal> {
+    pub(crate) fn gen_match_chunks<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+        read: bool,
+        offset: u64,
+    ) -> TokenStream {
         self.chunks
             .iter()
-            .map(|chunk| chunk.gen_match_chunks(read, offset))
+            .map(|chunk| chunk.gen_match_chunks(context, read, offset))
             .collect()
     }
-    pub fn gen_chunks(&self, read: bool, offset: u64) -> TokenStream {
+    pub(crate) fn gen_chunks<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+        read: bool,
+        offset: u64,
+    ) -> TokenStream {
         self.chunks
             .iter()
-            .map(|chunk| chunk.gen_chunks(read, offset))
+            .map(|chunk| chunk.gen_chunks(context, read, offset))
             .collect()
     }
-    pub fn gen_register_fun(&self, peripheral: &PeripheralPage) -> TokenStream {
+    pub(crate) fn gen_register_fun<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+    ) -> TokenStream {
         self.chunks
             .iter()
-            .map(|chunk| chunk.gen_register_functions(peripheral))
+            .map(|chunk| chunk.gen_register_functions(context))
             .collect()
     }
-    pub fn gen_fields_fun(&self, peripheral: &PeripheralPage) -> TokenStream {
+    pub(crate) fn gen_fields_fun<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+    ) -> TokenStream {
         self.chunks
             .iter()
-            .map(|chunk| chunk.gen_fields_functions(peripheral))
+            .map(|chunk| chunk.gen_fields_functions(context))
             .collect()
     }
 }
 
-impl MemoryChunk<MemoryThingFinal<'_>> {
-    pub fn gen_match_chunks(&self, read: bool, offset: u64) -> TokenStream {
+impl MemoryChunk<MemoryThingFinal> {
+    pub(crate) fn gen_match_chunks<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+        read: bool,
+        offset: u64,
+    ) -> TokenStream {
         let range = self.range();
         let start = (range.start != 0)
             .then_some(Literal::u64_unsuffixed(range.start + offset));
@@ -782,14 +819,19 @@ impl MemoryChunk<MemoryThingFinal<'_>> {
         let endm1 = Literal::u64_unsuffixed((range.end - 1) + offset);
         //is somewhat common to have full blocks with only read/write
         //permissions
-        let call = self.gen_chunks(read, offset);
+        let call = self.gen_chunks(context, read, offset);
         quote! {
             (#start..=#endm1, #startp1..=#end) => {
                 #call
             },
         }
     }
-    pub fn gen_chunks(&self, read: bool, offset: u64) -> TokenStream {
+    pub(crate) fn gen_chunks<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+        read: bool,
+        offset: u64,
+    ) -> TokenStream {
         //is somewhat common to have full blocks with only read/write
         //permissions
         let available_block = self.things.iter().any(|thing| {
@@ -810,31 +852,39 @@ impl MemoryChunk<MemoryThingFinal<'_>> {
         } else {
             self.things
                 .iter()
-                .map(|thing| thing.gen_thing_mem_map(read, offset))
+                .map(|thing| thing.gen_thing_mem_map(context, read, offset))
                 .collect()
         }
     }
 
-    pub fn gen_register_functions(
-        &self,
-        peripheral: &PeripheralPage,
+    pub(crate) fn gen_register_functions<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
     ) -> TokenStream {
         self.things
             .iter()
-            .map(|thing| thing.gen_register_functions(peripheral))
+            .map(|thing| thing.gen_register_functions(context))
             .collect()
     }
 
-    fn gen_fields_functions(&self, peripheral: &PeripheralPage) -> TokenStream {
+    fn gen_fields_functions<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+    ) -> TokenStream {
         self.things
             .iter()
-            .map(|thing| thing.gen_fields_functions(peripheral))
+            .map(|thing| thing.gen_fields_functions(context))
             .collect()
     }
 }
 
-impl<'a> MemoryThingFinal<'a> {
-    fn gen_thing_mem_map(&self, read: bool, offset: u64) -> TokenStream {
+impl MemoryThingFinal {
+    fn gen_thing_mem_map<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+        read: bool,
+        offset: u64,
+    ) -> TokenStream {
         let range = self.range();
         let offset_start = range.start + offset;
         let offset_end = range.end + offset;
@@ -846,23 +896,44 @@ impl<'a> MemoryThingFinal<'a> {
                 let _dim = ((_start - #offset_start_lit) % #len_lit) as usize;
             }
         });
-        let array_value = self.array().map(|_dim| quote! {_dim});
+        let peripheral_use = (context.peripheral.instances.len() > 1)
+            .then(|| quote! {_instance_page as usize});
+        let context_use = context
+            .clusters
+            .iter()
+            .filter_map(|clu| clu.dim.as_ref())
+            .map(|(dim_name, _dim)| quote! {#dim_name});
+        let reg_use = self.array().map(|_array| quote! { _dim });
+        let array_value = peripheral_use
+            .into_iter()
+            .chain(context_use)
+            .chain(reg_use.into_iter());
         match (read, self) {
             (_, Self::Cluster(cluster)) => {
                 //TODO read/write only chunk do something?
-                if cluster.clusters[0].array().is_some() {
-                    let mem = cluster
-                        .memory
-                        .gen_match_chunks(read, offset + self.offset());
+                if let Some((array_name, array)) = cluster.dim.as_ref() {
+                    context.clusters.push(cluster);
+                    let mem = cluster.memory.gen_match_chunks(
+                        context,
+                        read,
+                        offset + self.offset(),
+                    );
+                    context.clusters.pop();
+                    let len_lit = Literal::u32_unsuffixed(array.dim_increment);
+                    //TODO read between clusters
                     quote! {
-                        #array_num
+                        let #array_name = ((_start - #offset_start_lit) % #len_lit) as usize;
                         match (_start, _end) {
                             #mem
                             _ => return Err(MemError::Unmapped),
                         }
                     }
                 } else {
-                    cluster.memory.gen_chunks(read, offset + self.offset())
+                    cluster.memory.gen_chunks(
+                        context,
+                        read,
+                        offset + self.offset(),
+                    )
                 }
             }
             (true, Self::Register(reg)) => {
@@ -886,7 +957,9 @@ impl<'a> MemoryThingFinal<'a> {
                             .0
                             .lock()
                             .unwrap()
-                            .#read(#array_value)?
+                            .#read(
+                                #(#array_value,)*
+                            )?
                             .to_ne_bytes();
                         #(#bytes)*
                     }
@@ -902,7 +975,6 @@ impl<'a> MemoryThingFinal<'a> {
             }
             (false, Self::Register(reg)) => {
                 if let Some(write) = reg.write_fun.as_ref() {
-                    let array_value = array_value.into_iter();
                     quote! {
                         if _start < #offset_end_lit && _end > #offset_start_lit {
                             #array_num
@@ -927,28 +999,45 @@ impl<'a> MemoryThingFinal<'a> {
         }
     }
 
-    fn gen_register_functions(
-        &self,
-        peripheral: &PeripheralPage,
+    fn gen_register_functions<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
     ) -> TokenStream {
         match self {
             Self::Register(reg) => {
                 let mut tokens = TokenStream::new();
-                reg.gen_register_function(peripheral, &mut tokens);
+                context.register = Some(reg);
+                reg.gen_register_function(context, &mut tokens);
+                context.register = None;
                 tokens
             }
-            Self::Cluster(clu) => clu.gen_register_functions(peripheral),
+            Self::Cluster(clu) => {
+                context.clusters.push(clu);
+                let tokens = clu.gen_register_functions(context);
+                context.clusters.pop();
+                tokens
+            }
         }
     }
 
-    fn gen_fields_functions(&self, peripheral: &PeripheralPage) -> TokenStream {
+    fn gen_fields_functions<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+    ) -> TokenStream {
         match self {
             Self::Register(reg) => {
                 let mut tokens = TokenStream::new();
-                reg.gen_fields_functions(peripheral, &mut tokens);
+                context.register = Some(reg);
+                reg.gen_fields_functions(context, &mut tokens);
+                context.register = None;
                 tokens
             }
-            Self::Cluster(clu) => clu.gen_fields_functions(peripheral),
+            Self::Cluster(clu) => {
+                context.clusters.push(clu);
+                let stream = clu.gen_fields_functions(context);
+                context.clusters.pop();
+                stream
+            }
         }
     }
 }

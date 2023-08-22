@@ -3,73 +3,84 @@ use std::collections::HashMap;
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::{
-    ClusterInfo, Device, DimElement, MaybeArray, ModifiedWriteValues, Name,
-    ReadAction, RegisterInfo, RegisterProperties, WriteConstraint,
+    self, ClusterInfo, DimElement, MaybeArray, ModifiedWriteValues, Name,
+    ReadAction, RegisterProperties, WriteConstraint,
 };
 
+use crate::enumeration::FieldRWType;
 use crate::field::{FieldAccess, FieldData};
-use crate::formater::dim_to_n;
+use crate::formater::{dim_to_n, snake_case};
 use crate::helper::{self, Dim};
 use crate::memory::{
-    Context, Memory, MemoryChunks, MemoryThingCondensated, MemoryThingFinal,
+    ContextMemoryGen, Memory, MemoryChunks, MemoryThingCondensated,
+    MemoryThingFinal,
 };
-use crate::peripheral::PeripheralPage;
+use crate::peripheral::ContextCodeGen;
 
-pub struct ClusterAccess<'a> {
+#[derive(Debug)]
+pub struct ClusterAccess {
     pub bytes: u64,
-    pub clusters: Vec<&'a MaybeArray<ClusterInfo>>,
-    pub memory: MemoryChunks<MemoryThingFinal<'a>>,
+    //pub clusters: Vec<&'a MaybeArray<ClusterInfo>>,
+    pub address_offset: u32,
+    pub dim: Option<(Ident, DimElement)>,
+    pub memory: MemoryChunks<MemoryThingFinal>,
 }
 
-impl<'a> ClusterAccess<'a> {
-    pub(crate) fn new<'b>(
-        context: &mut Context<'b>,
-        device: &'a Device,
+impl ClusterAccess {
+    pub(crate) fn new<'a>(
+        context: &mut ContextMemoryGen<'a, '_>,
         clusters: Vec<&'a MaybeArray<ClusterInfo>>,
         memory: MemoryChunks<MemoryThingCondensated<'a>>,
     ) -> Self {
-        // generate the names
         let mut bytes = memory.len();
         if let Some(dim) = clusters[0].array() {
             bytes = dim.dim as u64 * dim.dim_increment as u64;
         }
-        // combine the clusters names, if they overlap
-        let cluster_name = clusters
-            .iter()
-            .map(|cluster| dim_to_n(&cluster.name().to_lowercase()))
-            .collect();
-        context.clusters.push(cluster_name);
-        let memory = memory.finalize(context, device);
-        context.clusters.pop();
+
+        context.clusters.push(clusters);
+        let memory = memory.finalize(context);
+        let clusters = context.clusters.pop().unwrap();
+
+        let dim = clusters[0].array().cloned().map(|dim| {
+            let name = snake_case(&dim_to_n(clusters[0].name()).to_lowercase());
+            let ident = format_ident!("_{name}");
+            (ident, dim)
+        });
         Self {
-            clusters,
+            address_offset: clusters[0].address_offset,
+            dim,
             bytes,
             memory,
         }
     }
 
-    pub(crate) fn gen_register_functions(
-        &self,
-        peripheral: &PeripheralPage,
+    pub(crate) fn gen_register_functions<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
     ) -> TokenStream {
-        self.memory.gen_register_fun(peripheral)
+        let stream = self.memory.gen_register_fun(context);
+        stream
     }
 
-    pub(crate) fn gen_fields_functions(
-        &self,
-        peripheral: &PeripheralPage,
+    pub(crate) fn gen_fields_functions<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
     ) -> TokenStream {
-        self.memory.gen_fields_functions(peripheral)
+        let stream = self.memory.gen_fields_functions(context);
+        stream
     }
 }
 
 #[derive(Debug)]
-pub struct RegisterAccess<'a> {
+pub struct RegisterAccess {
     pub read_fun: Option<Ident>,
     pub write_fun: Option<Ident>,
-    pub registers: Vec<&'a MaybeArray<RegisterInfo>>,
-    pub fields: Vec<FieldAccess<'a>>,
+    pub name: String,
+    pub doc: String,
+    pub fields: Vec<FieldAccess>,
     pub properties: RegisterProperties,
+    pub address_offset: u32,
+    pub array: Option<DimElement>,
     /// reset value, except for the fields (0s in there)
     pub clean_value: u64,
     pub modified_write_values: Option<ModifiedWriteValues>,
@@ -77,12 +88,11 @@ pub struct RegisterAccess<'a> {
     pub read_action: Option<ReadAction>,
 }
 
-impl<'a> RegisterAccess<'a> {
-    pub(crate) fn new(
-        context: &Context,
-        device: &'a Device,
+impl RegisterAccess {
+    pub(crate) fn new<'a>(
+        context: &mut ContextMemoryGen<'a, '_>,
         properties: RegisterProperties,
-        registers: Vec<&'a MaybeArray<RegisterInfo>>,
+        registers: Vec<&'a svd::Register>,
     ) -> Self {
         // all register names, used for error messages
         let regs_names = || {
@@ -130,6 +140,21 @@ impl<'a> RegisterAccess<'a> {
             )
         }
 
+        // remove the fields from the reset value
+        let clean_value = registers.iter().flat_map(|reg| reg.fields()).fold(
+            reset_value & reset_mask,
+            |clean, field| {
+                let mut bit_width = field.bit_width();
+                if let Some(array) = field.array() {
+                    assert_eq!(array.dim_increment, bit_width);
+                    bit_width *= array.dim;
+                }
+                let bits = u64::MAX >> (u64::BITS - bit_width);
+                let mask = bits << field.lsb();
+                clean & !mask
+            },
+        );
+
         let mut fields: HashMap<u32, Vec<_>> = HashMap::new();
         for field in registers.iter().flat_map(|reg| reg.fields()) {
             fields
@@ -137,36 +162,38 @@ impl<'a> RegisterAccess<'a> {
                 .or_insert_with(|| vec![])
                 .push(field);
         }
+        // HACK: field overlapping could happen, for now just remove the bigger
+        // less generalized field
+        for fields in fields.values_mut().filter(|fields| fields.len() > 1) {
+            let min_len =
+                fields.iter().map(|field| field.bit_width()).min().unwrap();
+            fields.retain(|field| {
+                let retain = field.bit_width() == min_len;
+                if !retain {
+                    let loc = context.gen_location();
+                    let name = field.name();
+                    println!("Warning: removing general field {loc} {name}");
+                }
+                retain
+            });
+        }
         let mut fields: Vec<_> = fields
             .into_values()
             .map(|fields| {
                 // TODO compare field access with register access
                 FieldAccess::new(
                     context,
-                    device,
                     &properties,
                     fields,
-                    registers[0].is_array(),
                     &reg_name,
                     reset_value,
                     reset_mask,
                 )
             })
             .collect();
-        fields.sort_unstable_by_key(|field| field.fields[0].bit_offset());
+        fields.sort_unstable_by_key(|field| field.lsb);
 
         // TODO check for overlapping fields
-
-        // remove the fields from the reset value
-        let clean_value =
-            fields
-                .iter()
-                .fold(reset_value & reset_mask, |clean, field| {
-                    let bits =
-                        u64::MAX >> (u64::BITS - field.fields[0].bit_width());
-                    let mask = bits << field.fields[0].lsb();
-                    clean & !mask
-                });
 
         let modified_write_values = helper::combine_modify_write_value(
             registers
@@ -182,16 +209,32 @@ impl<'a> RegisterAccess<'a> {
             registers.iter().filter_map(|register| register.read_action),
         );
 
+        let docs: Vec<String> = registers
+            .iter()
+            .map(|reg| {
+                let name = reg.display_name.as_ref().unwrap_or(&reg.name);
+                let description = reg
+                    .description
+                    .as_ref()
+                    .map(String::as_str)
+                    .unwrap_or("No documentation");
+                format!("{name}: {description}")
+            })
+            .collect();
+
         Self {
             read_fun,
             write_fun,
-            registers,
-            fields,
             clean_value,
             properties,
             modified_write_values,
             write_constraint,
             read_action,
+            address_offset: registers[0].address_offset,
+            array: registers[0].array().cloned(),
+            name,
+            doc: docs.join("\n"),
+            fields,
         }
     }
 
@@ -199,80 +242,100 @@ impl<'a> RegisterAccess<'a> {
         self.fields.is_empty()
     }
 
-    pub(crate) fn gen_fields_functions(
-        &self,
-        _peripheral: &PeripheralPage,
+    pub(crate) fn gen_fields_functions<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
         tokens: &mut TokenStream,
     ) {
         if !self.implicit_field() {
-            self.fields.iter().for_each(|x| x.to_tokens(tokens))
+            context.register = Some(self);
+            self.fields
+                .iter()
+                .for_each(|x| x.gen_function(context, tokens));
+            context.register = None;
         } else {
             // implicit field, generate the pseudo field for this register
-            let docs: Vec<_> = self
-                .registers
-                .iter()
-                .filter_map(|reg| {
-                    Some(format!(
-                        "{}: {}\n",
-                        reg.name(),
-                        reg.description.as_ref()?,
-                    ))
-                })
-                .collect();
-            let docs = docs.join("\n\n");
-            let name: Vec<_> = self
-                .registers
-                .iter()
-                .map(|reg| format!("{}", reg.name()))
-                .collect();
-            let name = name.join(", ");
             helper::read_write_field(
-                self.array().is_some(),
-                &name,
+                context,
+                None,
+                &self.name,
                 self.read_fun.as_ref(),
                 self.write_fun.as_ref(),
                 FieldData::from_bytes(self.properties.size.unwrap() / 8),
                 self.properties.reset_value.unwrap_or(0),
                 self.properties.reset_mask.unwrap_or(0),
-                &docs,
+                &self.doc,
                 self.modified_write_values,
                 self.write_constraint,
                 self.read_action,
-                &[],
+                &FieldRWType::Nothing,
                 tokens,
-            )
+            );
         }
     }
 
     pub(crate) fn gen_register_function(
         &self,
-        peripheral: &PeripheralPage,
+        context: &mut ContextCodeGen,
         tokens: &mut TokenStream,
     ) {
-        let peripheral_field = &peripheral.field_name;
-        let dim_declare = self.array().map(|_| quote! {_dim: usize,});
-        let dim_use = self.array().map(|_| quote! {_dim,});
+        if self.implicit_field() {
+            self.gen_register_function_implicit_field(context, tokens);
+            return;
+        }
+        let peripheral_instance_declare =
+            (context.peripheral.instances.len() > 1).then(|| {
+                quote! { _peripheral_instance: usize, }
+            });
+        let peripheral_struct_field = &context.peripheral.field_name;
+        let peripheral_instance_index =
+            (context.peripheral.instances.len() > 1).then(|| {
+                quote! { [_peripheral_instance] }
+            });
+        let peripheral_field =
+            quote! { #peripheral_struct_field #peripheral_instance_index };
+
+        let cluster_instance_declare = context
+            .clusters
+            .iter()
+            .filter_map(|clu| clu.dim.as_ref())
+            .map(|(dim_name, _dim)| quote! {#dim_name: usize});
+        let register_instance_declare =
+            self.array().map(|_dim| quote! {_reg_array: usize});
+        let dim_declare =
+            cluster_instance_declare.chain(register_instance_declare);
+
+        let cluster_instance_use = context
+            .clusters
+            .iter()
+            .filter_map(|clu| clu.dim.as_ref())
+            .map(|(dim_name, _dim)| quote! {#dim_name});
+        let register_instance_use =
+            self.array().map(|_dim| quote! {_reg_array});
+        let dim_use = cluster_instance_use.chain(register_instance_use);
+
         let clean_value = Literal::u64_unsuffixed(self.clean_value);
         let bytes = self.properties.size.unwrap() / 8;
         let value_type = helper::DataType::from_bytes(bytes);
-        if self.implicit_field() {
-            self.gen_register_function_implicit_field(peripheral, tokens);
-            return;
-        }
         if bytes == 1 {
             if let Some(read) = self.read_fun.as_ref() {
                 let fields = self.fields.iter().filter_map(|field| {
                     let field_fun = field.read.as_ref()?;
-                    let lsb = field.fields[0].lsb();
+                    let lsb = field.lsb;
                     let rotate = (lsb > 0).then(|| quote! { << #lsb});
+                    let dim_use = dim_use.clone();
                     Some(quote! {
-                        self.#peripheral_field.#field_fun(#dim_use)? #rotate;
+                        self.#peripheral_field.#field_fun(
+                            #(#dim_use,)*
+                        )? #rotate;
                     })
                 });
+                let dim_declare = dim_declare.clone();
                 tokens.extend(quote! {
                     pub fn #read(
                         &mut self,
-                        #dim_declare
+                        #peripheral_instance_declare
+                        #(#dim_declare,)*
                     ) -> MemResult<#value_type> {
                         let mut _value = #clean_value;
                         #(_value |= #fields)*
@@ -283,14 +346,13 @@ impl<'a> RegisterAccess<'a> {
             if let Some(write) = self.write_fun.as_ref() {
                 let fields = self.fields.iter().filter_map(|field| {
                     let field_fun = field.write.as_ref()?;
-                    let lsb = field.fields[0].lsb();
+                    let lsb = field.lsb;
                     let rotate = (lsb > 0).then(|| quote! { >> #lsb});
-                    let mask =
-                        u8::MAX >> (u8::BITS - field.fields[0].bit_width());
-                    let dim = self.array().map(|_| quote! {_dim}).into_iter();
+                    let mask = u8::MAX >> (u8::BITS - field.bit_width);
+                    let dim_use = dim_use.clone();
                     Some(quote! {
                         self.#peripheral_field.#field_fun(
-                            #(#dim,)*
+                            #(#dim_use,)*
                             (_value #rotate) & #mask
                         )?;
                     })
@@ -298,7 +360,8 @@ impl<'a> RegisterAccess<'a> {
                 tokens.extend(quote! {
                     pub fn #write(
                         &mut self,
-                        #dim_declare
+                        #peripheral_instance_declare
+                        #(#dim_declare,)*
                         _value: #value_type,
                     ) -> MemResult<()> {
                         #(#fields)*
@@ -310,18 +373,26 @@ impl<'a> RegisterAccess<'a> {
             if let Some(read) = self.read_fun.as_ref() {
                 let fields = self.fields.iter().map(|field| {
                     let read = field.read.as_ref().unwrap();
-                    let lsb = field.fields[0].lsb();
+                    let lsb = field.lsb;
                     let rotate = (lsb > 0).then(|| quote! { << #lsb});
+                    let dim_use = dim_use.clone();
                     quote! {
                         _value |= #value_type::from(
-                            self.#peripheral_field.#read(#dim_use)?
+                            self.#peripheral_field.#read(
+                                #(#dim_use,)*
+                            )?
                         ) #rotate;
                     }
                 });
                 let clean_value = Literal::u64_unsuffixed(self.clean_value);
+                let dim_declare = dim_declare.clone();
                 tokens.extend(quote! {
                     // NOTE no comma on dim_declare
-                    pub fn #read(&mut self, #dim_declare) -> MemResult<#value_type> {
+                    pub fn #read(
+                        &mut self,
+                        #peripheral_instance_declare
+                        #(#dim_declare,)*
+                    ) -> MemResult<#value_type> {
                         let mut _value = #clean_value;
                         #(#fields)*
                         Ok(_value)
@@ -330,9 +401,10 @@ impl<'a> RegisterAccess<'a> {
             }
             if let Some(write) = self.write_fun.as_ref() {
                 let fields = self.fields.iter().map(|field| {
-                    let field_start = field.fields[0].lsb() / 8;
+                    let dim_use = dim_use.clone();
+                    let field_start = field.lsb / 8;
                     let field_bytes = field.data.bytes();
-                    let field_lsb = Literal::u32_unsuffixed(field.fields[0].lsb() % 8);
+                    let field_lsb = Literal::u32_unsuffixed(field.lsb % 8);
                     let field_end = Literal::u32_unsuffixed(field_start + field_bytes);
                     let field_start = Literal::u32_unsuffixed(field_start);
 
@@ -350,7 +422,7 @@ impl<'a> RegisterAccess<'a> {
                                 if (_start.._end).contains(&#field_start) {
                                     let _i = (#field_start - _start) as usize;
                                     self.#peripheral_field.#write(
-                                        #dim_use
+                                        #(#dim_use,)*
                                         (_value[_i] >> #field_lsb) & #mask,
                                     )?;
                                 }
@@ -368,7 +440,10 @@ impl<'a> RegisterAccess<'a> {
                                         _value[_offset_start.._offset_end]
                                         .try_into().unwrap()
                                     );
-                                    self.#peripheral_field.#write(#dim_use _value)?;
+                                    self.#peripheral_field.#write(
+                                        #(#dim_use,)*
+                                        _value,
+                                    )?;
                                 } else if (_start > #field_start && _start < #field_end)
                                     || (_end > #field_start && _end < #field_end) {
                                     return Err(MemError::WriteViolation);
@@ -410,7 +485,10 @@ impl<'a> RegisterAccess<'a> {
                                     #first_byte
                                     #middle_bytes
                                     #last_byte
-                                    self.#peripheral_field.#write(#dim_use _extracted)?;
+                                    self.#peripheral_field.#write(
+                                        #(#dim_use,)*
+                                        _extracted,
+                                    )?;
                                 } else if (_start > #field_start && _start < #field_end)
                                     || (_end > #field_start && _end < #field_end) {
                                     return Err(MemError::WriteViolation);
@@ -425,7 +503,8 @@ impl<'a> RegisterAccess<'a> {
                     // NOTE no comma on dim_declare
                     pub fn #write(
                         &mut self,
-                        #dim_declare
+                        #peripheral_instance_declare
+                        #(#dim_declare,)*
                         _start: u64,
                         _value: &[u8],
                     ) -> MemResult<()> {
@@ -441,35 +520,68 @@ impl<'a> RegisterAccess<'a> {
 
     fn gen_register_function_implicit_field(
         &self,
-        peripheral: &PeripheralPage,
+        context: &mut ContextCodeGen,
         tokens: &mut TokenStream,
     ) {
-        let dim_use = self.array().map(|_| quote! {_dim});
-        let peripheral_field = &peripheral.field_name;
-        let dim_declare = self.array().map(|_| quote! {_dim: usize,});
+        let cluster_instance_declare = context
+            .clusters
+            .iter()
+            .filter_map(|clu| clu.dim.as_ref())
+            .map(|(dim_name, _dim)| quote! {#dim_name: usize});
+        let register_instance_declare =
+            self.array().map(|_dim| quote! {_reg_array: usize});
+        let dim_declare =
+            cluster_instance_declare.chain(register_instance_declare);
+
+        let cluster_instance_use = context
+            .clusters
+            .iter()
+            .filter_map(|clu| clu.dim.as_ref())
+            .map(|(dim_name, _dim)| quote! {#dim_name});
+        let register_instance_use =
+            self.array().map(|_dim| quote! {_reg_array});
+        let dim_use = cluster_instance_use.chain(register_instance_use);
+
+        let peripheral_struct_field = &context.peripheral.field_name;
+        let peripheral_instance_index =
+            (context.peripheral.instances.len() > 1).then(|| {
+                quote! { [_peripheral_instance] }
+            });
+        let peripheral_field =
+            quote! { #peripheral_struct_field #peripheral_instance_index };
+
         let bytes = self.properties.size.unwrap() / 8;
         let bytes_lit = Literal::u32_unsuffixed(bytes);
         let value_type = helper::DataType::from_bytes(bytes);
         if bytes == 1 {
             todo!("one byte register");
         }
+        let peripheral_instance_declare =
+            (context.peripheral.instances.len() > 1).then(|| {
+                quote! { _peripheral_instance: usize, }
+            });
         if let Some(read) = &self.read_fun {
+            let dim_declare = dim_declare.clone();
+            let dim_use = dim_use.clone();
             tokens.extend(quote! {
                 pub fn #read(
                     &mut self,
-                    #dim_declare
+                    #peripheral_instance_declare
+                    #(#dim_declare,)*
                 ) -> MemResult<#value_type> {
-                    self.#peripheral_field.#read(#dim_use)
+                    self.#peripheral_field.#read(#(#dim_use,)*)
                 }
             })
         }
         if let Some(write) = &self.write_fun {
-            let dim_use = dim_use.into_iter();
             // TODO implement byte endian here
+            let dim_declare = dim_declare.clone();
+            let dim_use = dim_use.clone();
             tokens.extend(quote! {
                 pub fn #write(
                     &mut self,
-                    #dim_declare
+                    #peripheral_instance_declare
+                    #(#dim_declare,)*
                     _start: u64,
                     _value: &[u8],
                 ) -> MemResult<()> {
@@ -486,8 +598,8 @@ impl<'a> RegisterAccess<'a> {
     }
 }
 
-impl Dim for RegisterAccess<'_> {
+impl Dim for RegisterAccess {
     fn array(&self) -> Option<&DimElement> {
-        self.registers[0].array()
+        self.array.as_ref()
     }
 }

@@ -1,11 +1,12 @@
 use proc_macro2::{Ident, TokenStream};
 use quote::{quote, ToTokens};
 use svd_parser::svd::{
-    DimElement, EnumeratedValues, MaybeArray, ModifiedWriteValues, ReadAction,
-    WriteConstraint,
+    DimElement, MaybeArray, ModifiedWriteValues, ReadAction, WriteConstraint,
 };
 
-use crate::field::FieldData;
+use crate::{
+    enumeration::FieldRWType, field::FieldData, peripheral::ContextCodeGen,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
@@ -48,8 +49,9 @@ impl ToTokens for DataType {
     }
 }
 
-pub fn read_write_field(
-    is_array: bool,
+pub(crate) fn read_write_field(
+    context: &mut ContextCodeGen,
+    field_array: Option<&DimElement>,
     name: &str,
     read: Option<&Ident>,
     write: Option<&Ident>,
@@ -60,7 +62,7 @@ pub fn read_write_field(
     modified_write_values: Option<ModifiedWriteValues>,
     write_constraint: Option<WriteConstraint>,
     read_action: Option<ReadAction>,
-    _enumerate_values: &[EnumeratedValues],
+    enumerate_values: &FieldRWType,
     tokens: &mut TokenStream,
 ) {
     let todo_msg = |read| {
@@ -81,23 +83,42 @@ pub fn read_write_field(
         }
         output
     };
-    let dim = is_array.then(|| quote! {_dim: usize});
+    let cluster_instance_declare = context
+        .clusters
+        .iter()
+        .filter_map(|clu| clu.dim.as_ref())
+        .map(|(dim_name, _dim)| quote! {#dim_name: usize});
+    let register_instance_declare = context
+        .register
+        .and_then(|reg| reg.array())
+        .map(|_dim| quote! {_reg_array: usize});
+    let field_array_declare = field_array.map(|_| quote! {_dim: usize});
+    let array_vars_declare = cluster_instance_declare
+        .chain(register_instance_declare)
+        .chain(field_array_declare);
     let value_type = DataType::from_bits(data.bits());
     if let Some(read) = read.as_ref() {
+        let array_vars_declare = array_vars_declare.clone();
         let todo_msg = todo_msg(true);
         tokens.extend(quote! {
             #[doc = #doc]
-            pub(crate) fn #read(&self, #dim) -> MemResult<#value_type> {
+            pub(crate) fn #read(
+                &self,
+                #(#array_vars_declare,)*
+            ) -> MemResult<#value_type> {
                 todo!(#todo_msg)
             }
         });
     }
     if let Some(write) = write.as_ref() {
-        let dim = dim.into_iter();
         let todo_msg = todo_msg(false);
         tokens.extend(quote! {
             #[doc = #doc]
-            pub(crate) fn #write(&mut self, #(#dim,)* _value: #value_type) -> MemResult<()> {
+            pub(crate) fn #write(
+                &mut self,
+                #(#array_vars_declare,)*
+                _value: #value_type,
+            ) -> MemResult<()> {
                 todo!(#todo_msg)
             }
         });
@@ -121,17 +142,6 @@ impl<T> Dim for MaybeArray<T> {
             MaybeArray::Array(_, dim) => Some(dim),
         }
     }
-}
-
-pub fn offsets_from_dim<'a>(
-    dim: &'a DimElement,
-) -> impl Iterator<Item = u32> + Clone + 'a {
-    let mut acc = 0;
-    (0..dim.dim).map(move |_i| {
-        let next = acc;
-        acc += dim.dim_increment;
-        next
-    })
 }
 
 fn stuff_need_to_be_equal<S: Eq + core::fmt::Debug>(
@@ -163,26 +173,3 @@ pub fn combine_read_actions(
 ) -> Option<ReadAction> {
     stuff_need_to_be_equal(iter)
 }
-
-pub fn combine_enumerate_value<'a>(
-    iter: impl Iterator<Item = &'a EnumeratedValues>,
-) -> Vec<EnumeratedValues> {
-    let mut output: Vec<EnumeratedValues> = vec![];
-    for values in iter {
-        if values.derived_from.is_some() {
-            todo!("enumerated value derive {:?}", &values.derived_from);
-        }
-        if let Some(acc_value) =
-            output.iter_mut().find(|o| o.usage() == values.usage())
-        {
-            acc_value.name = acc_value.name.take().or(values.name.clone());
-            acc_value.usage = acc_value.usage.take().or(values.usage.clone());
-            acc_value.values.extend(values.values.iter().cloned());
-        } else {
-            output.push(values.clone())
-        }
-    }
-    // TODO check of redundant usages?
-    output
-}
-

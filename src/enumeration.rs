@@ -1,84 +1,97 @@
+use std::collections::HashMap;
+
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote};
-use svd_parser::svd::{Device, EnumeratedValues, FieldInfo, MaybeArray};
+use svd_parser::svd;
 
-use crate::{
-    formater::{camel_case, dim_to_n},
-    helper,
-};
+use crate::formater::camel_case;
+use crate::helper;
+use crate::peripheral::EnumerationValuesId;
 
-pub struct Enumeration<'a> {
-    enum_name: Ident,
-    bits: u32,
-    values: &'a EnumeratedValues,
+#[derive(Debug)]
+pub struct EnumerationValues {
+    // list of unique-ids for enumerations combined to create this struct.
+    // For now the id is just the mem address, TODO use a more elegant id.
+    pub ids: Vec<usize>,
+    pub bits: u32,
+    pub enum_name: Ident,
+    pub values: Vec<FieldValue>,
 }
 
-impl<'a> Enumeration<'a> {
-    pub fn combine_all(svds: &'a [Device]) -> Vec<Enumeration<'a>> {
-        svds.iter()
-            .flat_map(|svd| svd.peripherals.iter())
-            .flat_map(|per| per.all_registers())
-            .flat_map(|reg| reg.fields())
-            // we don't care about bools, most are just disable/enable
-            .filter(|field| field.bit_width() > 1)
-            .flat_map(|field| {
-                std::iter::repeat(field)
-                    .zip(field.enumerated_values.as_slice().iter())
-            })
-            // don't need the `derived_from`, just get the implementations
-            .filter(|(_field, value)| value.derived_from.is_none())
-            .enumerate()
-            .map(|(i, (field, values))| Self::new(i, field, values))
-            .collect()
-    }
+#[derive(Debug, Default)]
+pub enum FieldRWType {
+    #[default]
+    Nothing,
+    ReadWrite {
+        read_write: EnumerationValuesId,
+    },
+    Separated {
+        read: EnumerationValuesId,
+        write: EnumerationValuesId,
+    },
+}
 
-    fn new(
-        i: usize,
-        field: &'a MaybeArray<FieldInfo>,
-        values: &'a EnumeratedValues,
-    ) -> Self {
-        let enum_name = if let Some(name) = &values.name {
-            // fields are usualy uppercase
-            format_ident!("E{i}{}", camel_case(&name.to_lowercase()))
-        } else {
-            format_ident!("E{i}{}", camel_case(&dim_to_n(&field.name.to_lowercase())))
-        };
-        let bits = field.bit_width();
-        Self {
-            enum_name,
-            values,
-            bits,
+#[derive(Debug)]
+pub struct FieldValue {
+    value: u64,
+    name: Ident,
+    doc: String,
+}
+
+impl FieldValue {
+    pub(crate) fn combine_fields(
+        values: &[&svd::EnumeratedValue],
+    ) -> Vec<Self> {
+        let mut field_values = HashMap::new();
+        for field_value in values.iter() {
+            let value = field_value.value.unwrap();
+            field_values
+                .entry(value)
+                .or_insert(vec![])
+                .push(field_value);
         }
+        let mut values: Vec<_> = field_values
+            .into_iter()
+            .enumerate()
+            .map(|(i, (value, fv))| {
+                let docs: Vec<_> = fv
+                    .iter()
+                    .filter_map(|v| v.description.as_ref().map(String::as_str))
+                    .collect();
+                let name = camel_case(&fv[0].name.to_lowercase());
+                Self {
+                    value,
+                    name: format_ident!("E{i}{name}"),
+                    doc: docs.join("\n"),
+                }
+            })
+            .collect();
+        values.sort_unstable_by_key(|v| v.value);
+        values
     }
+}
 
+impl EnumerationValues {
     pub fn gen_enum(&self) -> TokenStream {
+        assert!(self.bits > 1);
         let data_type = helper::DataType::from_bits(self.bits);
         let name = &self.enum_name;
-        let discriminants =
-            self.values.values.iter().enumerate().map(|(i, value)| {
-                let doc = value
-                    .description
-                    .as_ref()
-                    .map(|doc| quote! {#[doc = #doc]});
-                let field = format_ident!("D{i}{}", camel_case(&value.name));
-                value.value.unwrap();
-                let value = Literal::u64_unsuffixed(value.value.unwrap());
-                quote! {
-                    #doc
-                    #field = #value,
-                }
-            });
+        let discriminants = self.values.iter().map(|value| {
+            let doc = value.doc.as_str();
+            let field = &value.name;
+            let value = Literal::u64_unsuffixed(value.value);
+            quote! {
+                #[doc = #doc]
+                #field = #value,
+            }
+        });
         let values = self
             .values
-            .values
             .iter()
-            .map(|value| Literal::u64_unsuffixed(value.value.unwrap()));
-        let fields =
-            self.values.values.iter().enumerate().map(|(i, value)| {
-                format_ident!("D{i}{}", camel_case(&value.name))
-            });
+            .map(|value| Literal::u64_unsuffixed(value.value));
+        let fields = self.values.iter().map(|value| &value.name);
 
-        let impl_from = if 2usize.pow(self.bits) == self.values.values.len() {
+        let impl_from = if 2usize.pow(self.bits) == self.values.len() {
             quote! {
                 impl From<#data_type> for #name {
                     fn from(value: #data_type) -> #name {
