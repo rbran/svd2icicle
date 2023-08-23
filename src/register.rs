@@ -10,7 +10,7 @@ use svd_parser::svd::{
 use crate::enumeration::FieldRWType;
 use crate::field::{FieldAccess, FieldData};
 use crate::formater::{dim_to_n, snake_case};
-use crate::helper::{self, str_to_doc, Dim, DisplayName, DataType};
+use crate::helper::{self, str_to_doc, DataType, Dim, DisplayName};
 use crate::memory::{
     ContextMemoryGen, Memory, MemoryChunks, MemoryThingCondensated,
     MemoryThingFinal,

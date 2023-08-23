@@ -832,8 +832,8 @@ impl MemoryChunk<MemoryThingFinal> {
         read: bool,
         offset: u64,
     ) -> TokenStream {
-        //is somewhat common to have full blocks with only read/write
-        //permissions
+        // is somewhat common to have full blocks with only read/write
+        // permissions
         let available_block = self.things.iter().any(|thing| {
             if read {
                 thing.can_read()
@@ -897,7 +897,7 @@ impl MemoryThingFinal {
             }
         });
         let peripheral_use = (context.peripheral.instances.len() > 1)
-            .then(|| quote! {_instance_page as usize});
+            .then(|| quote! {_instance_page});
         let context_use = context
             .clusters
             .iter()

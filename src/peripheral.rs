@@ -26,6 +26,7 @@ pub struct Peripheral {
     pub mod_name: Ident,
     pub name_struct: Ident,
     pub field_name: Ident,
+    pub page_to_index_function: Ident,
     pub doc_names: Vec<String>,
     pub doc: String,
     pub chunks: MemoryChunks<MemoryThingFinal>,
@@ -169,6 +170,7 @@ impl Peripheral {
             mod_name: format_ident!("{}", snake_case(&name)),
             name_struct: format_ident!("{}", camel_case(&name)),
             field_name: format_ident!("{}", snake_case(&name)),
+            page_to_index_function: format_ident!("page_to_index"),
             chunks: MemoryChunks::new_page(&mut context, pers),
             doc,
             doc_names,
@@ -228,13 +230,10 @@ impl Device {
         let per_structs_fields =
             self.peripherals.iter().map(Peripheral::gen_struct_fields);
         // register function that could be overwriten by the user
-        let register_functions = self
-            .peripherals
-            .iter()
-            .map(|peripheral| {
-                context.peripheral = peripheral;
-                peripheral.chunks.gen_register_fun(context)
-            });
+        let register_functions = self.peripherals.iter().map(|peripheral| {
+            context.peripheral = peripheral;
+            peripheral.chunks.gen_register_fun(context)
+        });
         // all enums used by fields/registers
         let enums_declare =
             self.field_values.iter().map(EnumerationValues::gen_enum);
@@ -312,7 +311,23 @@ impl Device {
 }
 
 impl Peripheral {
-    // TODO peripheral instance to index mapping function
+    fn gen_page_to_index_function(&self) -> TokenStream {
+        let function = &self.page_to_index_function;
+        let page_instance =
+            self.instances.iter().enumerate().map(|(index, inst)| {
+                let page = inst.page >> ADDR_BITS;
+                quote! { #page => #index, }
+            });
+        quote! {
+            pub(crate) fn #function(page: u64) -> usize {
+                match page {
+                    #(#page_instance)*
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
     fn gen_struct<'a>(
         &'a self,
         context: &mut ContextCodeGen<'a>,
@@ -327,6 +342,7 @@ impl Peripheral {
             if self.doc_names.len() > 1 { "s" } else { "" },
             self.doc_names.join(", "),
         );
+        let page_to_index_function = self.gen_page_to_index_function();
         quote! {
             #[doc = #doc_mod]
             pub mod #mod_name {
@@ -338,6 +354,7 @@ impl Peripheral {
                     _todo: (),
                 }
                 impl #peripheral_struct {
+                    #page_to_index_function
                     #peripheral_fields
                 }
             }
@@ -381,6 +398,9 @@ impl Peripheral {
     ) -> TokenStream {
         context.peripheral = self;
         let pseudo_struct = &self.name_struct;
+        let mod_name = &self.mod_name;
+        let og_struct = &self.name_struct;
+        let page_to_index = &self.page_to_index_function;
         let write = self.chunks.gen_match_chunks(context, false, 0);
         let read = self.chunks.gen_match_chunks(context, true, 0);
         quote! {
@@ -395,7 +415,9 @@ impl Peripheral {
                     _addr: u64,
                     _buf: &mut [u8],
                 ) -> MemResult<()> {
-                    let _instance_page = _addr >> #ADDR_BITS;
+                    let _instance_page = crate::peripheral::#mod_name::#og_struct::#page_to_index(
+                        _addr >> #ADDR_BITS
+                    );
                     let _start = _addr & #ADDR_MASK;
                     let _end = _start + u64::try_from(_buf.len()).unwrap();
                     match (_start, _end) {
@@ -410,7 +432,9 @@ impl Peripheral {
                     _addr: u64,
                     _buf: &[u8],
                 ) -> MemResult<()> {
-                    let _instance_page = _addr >> #ADDR_BITS;
+                    let _instance_page = crate::peripheral::#mod_name::#og_struct::#page_to_index(
+                        _addr >> #ADDR_BITS
+                    );
                     let _start = _addr & #ADDR_MASK;
                     let _end = _start + u64::try_from(_buf.len()).unwrap();
                     match (_start, _end) {
