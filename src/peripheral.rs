@@ -4,7 +4,7 @@ use std::fmt::Write;
 use std::num::NonZeroU32;
 
 use proc_macro2::{Ident, Literal, TokenStream};
-use quote::{format_ident, quote, ToTokens};
+use quote::{format_ident, quote};
 use svd_parser::svd::{self, Name};
 
 use crate::enumeration::EnumerationValues;
@@ -129,6 +129,10 @@ impl Device {
             field_values,
         }
     }
+
+    pub fn get_enum(&self, enum_id: EnumerationValuesId) -> &EnumerationValues {
+        &self.field_values[enum_id.0]
+    }
 }
 
 impl Peripheral {
@@ -197,26 +201,40 @@ impl PeripheralInstance {
 
 impl Device {
     pub fn gen_all(&self, tokens: &mut TokenStream) {
-        self.gen_peripheral(tokens);
-        self.gen_pages(tokens);
+        let mut context = ContextCodeGen {
+            // HACK allow empty peripheral? Make this a builder like pattern?
+            peripheral: &self.peripherals[0],
+            clusters: vec![],
+            register: None,
+            device: self,
+        };
+        self.gen_peripheral(&mut context, tokens);
+        self.gen_pages(&mut context, tokens);
         self.gen_map_pages(tokens);
     }
 
-    fn gen_peripheral(&self, tokens: &mut TokenStream) {
+    fn gen_peripheral<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+        tokens: &mut TokenStream,
+    ) {
         // structs for each peripherals
-        let per_structs = self.peripherals.iter().map(Peripheral::gen_struct);
+        let per_structs: TokenStream = self
+            .peripherals
+            .iter()
+            .map(|x| x.gen_struct(context))
+            .collect();
         // structs fields for each peripherals in the main Struct
         let per_structs_fields =
             self.peripherals.iter().map(Peripheral::gen_struct_fields);
         // register function that could be overwriten by the user
-        let register_functions = self.peripherals.iter().map(|peripheral| {
-            let mut context = ContextCodeGen {
-                peripheral,
-                clusters: vec![],
-                register: None,
-            };
-            peripheral.chunks.gen_register_fun(&mut context)
-        });
+        let register_functions = self
+            .peripherals
+            .iter()
+            .map(|peripheral| {
+                context.peripheral = peripheral;
+                peripheral.chunks.gen_register_fun(context)
+            });
         // all enums used by fields/registers
         let enums_declare =
             self.field_values.iter().map(EnumerationValues::gen_enum);
@@ -228,7 +246,7 @@ impl Device {
                 pub mod enums {
                     #(#enums_declare)*
                 }
-                #(#per_structs)*
+                #per_structs
                 #[doc = "Register read/write from pages, used for behavior affecting multiple peripherals"]
                 pub(crate) mod registers {
                     use icicle_vm::cpu::mem::{MemResult, MemError};
@@ -245,9 +263,16 @@ impl Device {
         });
     }
 
-    fn gen_pages(&self, tokens: &mut TokenStream) {
+    fn gen_pages<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+        tokens: &mut TokenStream,
+    ) {
         // all the memory blocks
-        let pages = self.peripherals.iter().map(Peripheral::gen_pages);
+        let pages = self.peripherals.iter().map(|peripheral| {
+            context.peripheral = peripheral;
+            peripheral.gen_pages(context)
+        });
         // gen the empty struct, and read/write functions
         tokens.extend(quote! {
             mod pages {
@@ -257,7 +282,7 @@ impl Device {
         });
     }
 
-    fn gen_map_pages(&self, tokens: &mut TokenStream) {
+    fn gen_map_pages<'a>(&'a self, tokens: &mut TokenStream) {
         // memory pages mapping to the cpu
         let memory_cpu_map = self.peripherals.iter().map(|per| {
             let pseudo_struct = &per.name_struct;
@@ -287,14 +312,36 @@ impl Device {
 }
 
 impl Peripheral {
-    fn gen_struct<'b>(&'b self) -> impl ToTokens + 'b {
-        struct Tokens<'b>(&'b Peripheral);
-        impl ToTokens for Tokens<'_> {
-            fn to_tokens(&self, tokens: &mut TokenStream) {
-                gen_struct_to_tokens(self.0, tokens)
+    // TODO peripheral instance to index mapping function
+    fn gen_struct<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+    ) -> TokenStream {
+        context.peripheral = self;
+        let mod_name = &self.mod_name;
+        let peripheral_struct = &self.name_struct;
+        let doc = &self.doc;
+        let peripheral_fields = self.gen_fields_functions(context);
+        let doc_mod = format!(
+            "Peripheral{} {}",
+            if self.doc_names.len() > 1 { "s" } else { "" },
+            self.doc_names.join(", "),
+        );
+        quote! {
+            #[doc = #doc_mod]
+            pub mod #mod_name {
+                use icicle_vm::cpu::mem::MemResult;
+                #[derive(Default)]
+                #[doc = #doc]
+                pub struct #peripheral_struct {
+                    #[doc = "TODO: implement things here"]
+                    _todo: (),
+                }
+                impl #peripheral_struct {
+                    #peripheral_fields
+                }
             }
         }
-        Tokens(self)
     }
 
     fn num_instances(&self) -> u32 {
@@ -328,15 +375,14 @@ impl Peripheral {
         }
     }
 
-    fn gen_pages(&self) -> TokenStream {
+    fn gen_pages<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+    ) -> TokenStream {
+        context.peripheral = self;
         let pseudo_struct = &self.name_struct;
-        let mut context = ContextCodeGen {
-            peripheral: self,
-            clusters: vec![],
-            register: None,
-        };
-        let write = self.chunks.gen_match_chunks(&mut context, false, 0);
-        let read = self.chunks.gen_match_chunks(&mut context, true, 0);
+        let write = self.chunks.gen_match_chunks(context, false, 0);
+        let read = self.chunks.gen_match_chunks(context, true, 0);
         quote! {
             pub(crate) struct #pseudo_struct(
                 pub std::sync::Arc<
@@ -378,46 +424,13 @@ impl Peripheral {
         }
     }
 
-    fn gen_fields_functions(&self) -> TokenStream {
-        let mut context = ContextCodeGen {
-            peripheral: self,
-            clusters: vec![],
-            register: None,
-        };
-        self.chunks.gen_fields_fun(&mut context)
+    fn gen_fields_functions<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+    ) -> TokenStream {
+        context.peripheral = self;
+        self.chunks.gen_fields_fun(context)
     }
-}
-
-// TODO peripheral instance to index mapping function
-fn gen_struct_to_tokens(peripheral: &Peripheral, tokens: &mut TokenStream) {
-    let mod_name = &peripheral.mod_name;
-    let peripheral_struct = &peripheral.name_struct;
-    let doc = &peripheral.doc;
-    let peripheral_fields = peripheral.gen_fields_functions();
-    let doc_mod = format!(
-        "Peripheral{} {}",
-        if peripheral.doc_names.len() > 1 {
-            "s"
-        } else {
-            ""
-        },
-        peripheral.doc_names.join(", "),
-    );
-    tokens.extend(quote! {
-        #[doc = #doc_mod]
-        pub mod #mod_name {
-            use icicle_vm::cpu::mem::MemResult;
-            #[derive(Default)]
-            #[doc = #doc]
-            pub struct #peripheral_struct {
-                #[doc = "TODO: implement things here"]
-                _todo: (),
-            }
-            impl #peripheral_struct {
-                #peripheral_fields
-            }
-        }
-    })
 }
 
 // combine peripherals that share the same page
@@ -524,6 +537,7 @@ fn find_peripheral_or_create_implementation<'a>(
 }
 
 pub(crate) struct ContextCodeGen<'a> {
+    pub device: &'a Device,
     pub peripheral: &'a Peripheral,
     pub clusters: Vec<&'a ClusterAccess>,
     pub register: Option<&'a RegisterAccess>,

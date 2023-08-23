@@ -10,7 +10,7 @@ use svd_parser::svd::{
 use crate::enumeration::FieldRWType;
 use crate::field::{FieldAccess, FieldData};
 use crate::formater::{dim_to_n, snake_case};
-use crate::helper::{self, str_to_doc, Dim, DisplayName};
+use crate::helper::{self, str_to_doc, Dim, DisplayName, DataType};
 use crate::memory::{
     ContextMemoryGen, Memory, MemoryChunks, MemoryThingCondensated,
     MemoryThingFinal,
@@ -333,11 +333,19 @@ impl RegisterAccess {
                     let lsb = field.lsb;
                     let rotate = (lsb > 0).then(|| quote! { << #lsb});
                     let dim_use = dim_use.clone();
-                    Some(quote! {
-                        self.#peripheral_field.#field_fun(
-                            #(#dim_use,)*
-                        )? #rotate;
-                    })
+                    match field.enumerated_values {
+                        FieldRWType::Nothing => Some(quote! {
+                            self.#peripheral_field.#field_fun(
+                                #(#dim_use,)*
+                            )? #rotate;
+                        }),
+                        FieldRWType::ReadWrite { .. }
+                        | FieldRWType::Separated { .. } => Some(quote! {
+                            (self.#peripheral_field.#field_fun(
+                                #(#dim_use,)*
+                            )? as u8) #rotate;
+                        }),
+                    }
                 });
                 let dim_declare = dim_declare.clone();
                 let doc = doc(true);
@@ -362,12 +370,21 @@ impl RegisterAccess {
                     let rotate = (lsb > 0).then(|| quote! { >> #lsb});
                     let mask = u8::MAX >> (u8::BITS - field.bit_width);
                     let dim_use = dim_use.clone();
-                    Some(quote! {
-                        self.#peripheral_field.#field_fun(
-                            #(#dim_use,)*
-                            (_value #rotate) & #mask
-                        )?;
-                    })
+                    match field.enumerated_values {
+                        FieldRWType::Nothing => Some(quote! {
+                            self.#peripheral_field.#field_fun(
+                                #(#dim_use,)*
+                                (_value #rotate) & #mask
+                            )?;
+                        }),
+                        FieldRWType::ReadWrite { .. }
+                        | FieldRWType::Separated { .. } => Some(quote! {
+                            self.#peripheral_field.#field_fun(
+                                #(#dim_use,)*
+                                ((_value as u8) #rotate) & #mask
+                            )?;
+                        }),
+                    }
                 });
                 let doc = doc(false);
                 tokens.extend(quote! {
@@ -387,16 +404,27 @@ impl RegisterAccess {
         } else {
             if let Some(read) = self.read_fun.as_ref() {
                 let fields = self.fields.iter().map(|field| {
+                    let field_type = DataType::from_bits(field.bit_width);
                     let read = field.read.as_ref().unwrap();
                     let lsb = field.lsb;
                     let rotate = (lsb > 0).then(|| quote! { << #lsb});
                     let dim_use = dim_use.clone();
-                    quote! {
-                        _value |= #value_type::from(
-                            self.#peripheral_field.#read(
-                                #(#dim_use,)*
-                            )?
-                        ) #rotate;
+                    match field.enumerated_values {
+                        FieldRWType::Nothing => quote! {
+                            _value |= #value_type::from(
+                                self.#peripheral_field.#read(
+                                    #(#dim_use,)*
+                                )?
+                            ) #rotate;
+                        },
+                        FieldRWType::ReadWrite { .. }
+                        | FieldRWType::Separated { .. } => quote! {
+                            _value |= #value_type::from(
+                                self.#peripheral_field.#read(
+                                    #(#dim_use,)*
+                                )? as #field_type
+                            ) #rotate;
+                        },
                     }
                 });
                 let clean_value = Literal::u64_unsuffixed(self.clean_value);
@@ -428,6 +456,7 @@ impl RegisterAccess {
 
                     let write = field.write.as_ref().unwrap();
 
+                    //TODO match agains FieldRWType
                     match field.data {
                         FieldData::Single(bits) => {
                             let mask = if bits == 1 {
@@ -441,7 +470,9 @@ impl RegisterAccess {
                                     let _i = (#field_start - _start) as usize;
                                     self.#peripheral_field.#write(
                                         #(#dim_use,)*
-                                        (_value[_i] >> #field_lsb) & #mask,
+                                        ((_value[_i] >> #field_lsb) & #mask)
+                                            .try_into()
+                                            .map_err(|_| MemError::WriteViolation)?,
                                     )?;
                                 }
                             }
@@ -460,7 +491,9 @@ impl RegisterAccess {
                                     );
                                     self.#peripheral_field.#write(
                                         #(#dim_use,)*
-                                        _value,
+                                        _value
+                                            .try_into()
+                                            .map_err(|_| MemError::WriteViolation)?,
                                     )?;
                                 } else if (_start > #field_start && _start < #field_end)
                                     || (_end > #field_start && _end < #field_end) {
@@ -505,7 +538,9 @@ impl RegisterAccess {
                                     #last_byte
                                     self.#peripheral_field.#write(
                                         #(#dim_use,)*
-                                        _extracted,
+                                        _extracted
+                                            .try_into()
+                                            .map_err(|_| MemError::WriteViolation)?,
                                     )?;
                                 } else if (_start > #field_start && _start < #field_end)
                                     || (_end > #field_start && _end < #field_end) {

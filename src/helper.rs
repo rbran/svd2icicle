@@ -97,8 +97,23 @@ pub(crate) fn read_write_field(
     let array_vars_declare = cluster_instance_declare
         .chain(register_instance_declare)
         .chain(field_array_declare);
-    let value_type = DataType::from_bits(data.bits());
+    let value_type = |read_fun: bool| {
+        let enum_type = match enumerate_values {
+            FieldRWType::Nothing => {
+                return DataType::from_bits(data.bits()).into_token_stream()
+            }
+            FieldRWType::ReadWrite { read_write } => {
+                &context.device.get_enum(*read_write).enum_name
+            }
+            FieldRWType::Separated { read, write } => {
+                let id = if read_fun { *read } else { *write };
+                &context.device.get_enum(id).enum_name
+            }
+        };
+        quote! { crate::peripheral::enums::#enum_type }
+    };
     if let Some(read) = read.as_ref() {
+        let value_type = value_type(true);
         let array_vars_declare = array_vars_declare.clone();
         let todo_msg = todo_msg(true);
         tokens.extend(quote! {
@@ -112,6 +127,7 @@ pub(crate) fn read_write_field(
         });
     }
     if let Some(write) = write.as_ref() {
+        let value_type = value_type(false);
         let todo_msg = todo_msg(false);
         tokens.extend(quote! {
             #[doc = #doc]
