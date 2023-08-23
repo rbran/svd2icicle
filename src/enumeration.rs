@@ -5,7 +5,7 @@ use quote::{format_ident, quote};
 use svd_parser::svd;
 
 use crate::formater::camel_case;
-use crate::helper;
+use crate::helper::{self, str_to_doc};
 use crate::peripheral::EnumerationValuesId;
 
 #[derive(Debug)]
@@ -13,6 +13,7 @@ pub struct EnumerationValues {
     // list of unique-ids for enumerations combined to create this struct.
     // For now the id is just the mem address, TODO use a more elegant id.
     pub ids: Vec<usize>,
+    pub doc: String,
     pub bits: u32,
     pub enum_name: Ident,
     pub values: Vec<FieldValue>,
@@ -54,15 +55,24 @@ impl FieldValue {
             .into_iter()
             .enumerate()
             .map(|(i, (value, fv))| {
-                let docs: Vec<_> = fv
+                let doc = fv
                     .iter()
-                    .filter_map(|v| v.description.as_ref().map(String::as_str))
+                    .map(|v| {
+                        let name = str_to_doc(&v.name);
+                        let description = v
+                            .description
+                            .as_ref()
+                            .map(String::as_str)
+                            .map(str_to_doc)
+                            .unwrap_or("No documentation".to_string());
+                        format!("{name}: {description}<br>")
+                    })
                     .collect();
                 let name = camel_case(&fv[0].name.to_lowercase());
                 Self {
                     value,
                     name: format_ident!("E{i}{name}"),
-                    doc: docs.join("\n"),
+                    doc,
                 }
             })
             .collect();
@@ -115,7 +125,10 @@ impl EnumerationValues {
                 }
             }
         };
+        let doc = &self.doc;
+        let doc = (!doc.is_empty()).then(|| quote! { #[doc = #doc] });
         quote! {
+            #doc
             #[derive(Debug, Clone, Copy)]
             #[repr(#data_type)]
             pub enum #name {

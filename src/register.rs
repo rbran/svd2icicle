@@ -3,14 +3,14 @@ use std::collections::HashMap;
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::{
-    self, ClusterInfo, DimElement, MaybeArray, ModifiedWriteValues, Name,
-    ReadAction, RegisterProperties, WriteConstraint,
+    self, ClusterInfo, DimElement, MaybeArray, ModifiedWriteValues, ReadAction,
+    RegisterProperties, WriteConstraint,
 };
 
 use crate::enumeration::FieldRWType;
 use crate::field::{FieldAccess, FieldData};
 use crate::formater::{dim_to_n, snake_case};
-use crate::helper::{self, Dim};
+use crate::helper::{self, str_to_doc, Dim, DisplayName};
 use crate::memory::{
     ContextMemoryGen, Memory, MemoryChunks, MemoryThingCondensated,
     MemoryThingFinal,
@@ -42,7 +42,7 @@ impl ClusterAccess {
         let clusters = context.clusters.pop().unwrap();
 
         let dim = clusters[0].array().cloned().map(|dim| {
-            let name = snake_case(&dim_to_n(clusters[0].name()).to_lowercase());
+            let name = snake_case(&dim_to_n(&clusters[0].name).to_lowercase());
             let ident = format_ident!("_{name}");
             (ident, dim)
         });
@@ -171,7 +171,7 @@ impl RegisterAccess {
                 let retain = field.bit_width() == min_len;
                 if !retain {
                     let loc = context.gen_location();
-                    let name = field.name();
+                    let name = &field.name;
                     println!("Warning: removing general field {loc} {name}");
                 }
                 retain
@@ -209,16 +209,17 @@ impl RegisterAccess {
             registers.iter().filter_map(|register| register.read_action),
         );
 
-        let docs: Vec<String> = registers
+        let doc = registers
             .iter()
             .map(|reg| {
-                let name = reg.display_name.as_ref().unwrap_or(&reg.name);
+                let name = reg.doc_name();
                 let description = reg
                     .description
                     .as_ref()
                     .map(String::as_str)
-                    .unwrap_or("No documentation");
-                format!("{name}: {description}")
+                    .map(str_to_doc)
+                    .unwrap_or("No documentation".to_string());
+                format!("{name}: {description}<br>")
             })
             .collect();
 
@@ -233,7 +234,7 @@ impl RegisterAccess {
             address_offset: registers[0].address_offset,
             array: registers[0].array().cloned(),
             name,
-            doc: docs.join("\n"),
+            doc,
             fields,
         }
     }
@@ -317,6 +318,14 @@ impl RegisterAccess {
         let clean_value = Literal::u64_unsuffixed(self.clean_value);
         let bytes = self.properties.size.unwrap() / 8;
         let value_type = helper::DataType::from_bytes(bytes);
+        let doc = |read| {
+            format!(
+                "{} {} from {}",
+                if read { "Read" } else { "Write" },
+                str_to_doc(&self.name),
+                context.doc_peripheral(),
+            )
+        };
         if bytes == 1 {
             if let Some(read) = self.read_fun.as_ref() {
                 let fields = self.fields.iter().filter_map(|field| {
@@ -331,8 +340,11 @@ impl RegisterAccess {
                     })
                 });
                 let dim_declare = dim_declare.clone();
+                let doc = doc(true);
                 tokens.extend(quote! {
-                    pub fn #read(
+                    #[doc = #doc]
+                    #[inline]
+                    pub(crate) fn #read(
                         &mut self,
                         #peripheral_instance_declare
                         #(#dim_declare,)*
@@ -357,8 +369,11 @@ impl RegisterAccess {
                         )?;
                     })
                 });
+                let doc = doc(false);
                 tokens.extend(quote! {
-                    pub fn #write(
+                    #[doc = #doc]
+                    #[inline]
+                    pub(crate) fn #write(
                         &mut self,
                         #peripheral_instance_declare
                         #(#dim_declare,)*
@@ -386,9 +401,12 @@ impl RegisterAccess {
                 });
                 let clean_value = Literal::u64_unsuffixed(self.clean_value);
                 let dim_declare = dim_declare.clone();
+                let doc = doc(true);
                 tokens.extend(quote! {
                     // NOTE no comma on dim_declare
-                    pub fn #read(
+                    #[doc = #doc]
+                    #[inline]
+                    pub(crate) fn #read(
                         &mut self,
                         #peripheral_instance_declare
                         #(#dim_declare,)*
@@ -499,9 +517,12 @@ impl RegisterAccess {
 
                 });
                 // TODO implement byte endian here
+                let doc = doc(false);
                 tokens.extend(quote! {
                     // NOTE no comma on dim_declare
-                    pub fn #write(
+                    #[doc = #doc]
+                    #[inline]
+                    pub(crate) fn #write(
                         &mut self,
                         #peripheral_instance_declare
                         #(#dim_declare,)*
@@ -560,11 +581,22 @@ impl RegisterAccess {
             (context.peripheral.instances.len() > 1).then(|| {
                 quote! { _peripheral_instance: usize, }
             });
+        let doc = |read| {
+            format!(
+                "{} {} from {}",
+                if read { "Read" } else { "Write" },
+                str_to_doc(&self.name),
+                context.doc_peripheral(),
+            )
+        };
         if let Some(read) = &self.read_fun {
             let dim_declare = dim_declare.clone();
             let dim_use = dim_use.clone();
+            let doc = doc(true);
             tokens.extend(quote! {
-                pub fn #read(
+                #[doc = #doc]
+                #[inline]
+                pub(crate) fn #read(
                     &mut self,
                     #peripheral_instance_declare
                     #(#dim_declare,)*
@@ -577,8 +609,11 @@ impl RegisterAccess {
             // TODO implement byte endian here
             let dim_declare = dim_declare.clone();
             let dim_use = dim_use.clone();
+            let doc = doc(false);
             tokens.extend(quote! {
-                pub fn #write(
+                #[doc = #doc]
+                #[inline]
+                pub(crate) fn #write(
                     &mut self,
                     #peripheral_instance_declare
                     #(#dim_declare,)*

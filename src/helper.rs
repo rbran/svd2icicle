@@ -1,7 +1,8 @@
 use proc_macro2::{Ident, TokenStream};
 use quote::{quote, ToTokens};
 use svd_parser::svd::{
-    DimElement, MaybeArray, ModifiedWriteValues, ReadAction, WriteConstraint,
+    self, DimElement, MaybeArray, ModifiedWriteValues, ReadAction,
+    WriteConstraint,
 };
 
 use crate::{
@@ -172,4 +173,38 @@ pub fn combine_read_actions(
     iter: impl Iterator<Item = ReadAction>,
 ) -> Option<ReadAction> {
     stuff_need_to_be_equal(iter)
+}
+
+pub fn str_to_doc(doc: &str) -> String {
+    doc.replace('[', "\\[").replace(']', "\\]")
+}
+
+pub trait DisplayName {
+    fn display_name(&self) -> Option<&str>;
+    fn name(&self) -> &str;
+    fn doc_name(&self) -> String {
+        let name = str_to_doc(self.name());
+        self.display_name()
+            .map(|display_name| str_to_doc(display_name))
+            .map(|display_name| format!("{display_name} ({name})"))
+            .unwrap_or_else(|| name.to_string())
+    }
+}
+
+impl DisplayName for svd::Peripheral {
+    fn display_name(&self) -> Option<&str> {
+        self.display_name.as_ref().map(String::as_ref)
+    }
+    fn name(&self) -> &str {
+        self.name.as_str()
+    }
+}
+
+impl DisplayName for svd::Register {
+    fn display_name(&self) -> Option<&str> {
+        self.display_name.as_ref().map(String::as_ref)
+    }
+    fn name(&self) -> &str {
+        self.name.as_str()
+    }
 }

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::num::NonZeroU32;
 
 use proc_macro2::{Ident, Literal, TokenStream};
@@ -8,7 +9,7 @@ use svd_parser::svd::{self, Name};
 
 use crate::enumeration::EnumerationValues;
 use crate::formater::{camel_case, dim_to_n, snake_case};
-use crate::helper::Dim;
+use crate::helper::{str_to_doc, Dim, DisplayName};
 use crate::memory::{ContextMemoryGen, MemoryChunks, MemoryThingFinal};
 use crate::register::{ClusterAccess, RegisterAccess};
 use crate::{ADDR_BITS, ADDR_MASK, PAGE_LEN, PAGE_MASK};
@@ -25,6 +26,7 @@ pub struct Peripheral {
     pub mod_name: Ident,
     pub name_struct: Ident,
     pub field_name: Ident,
+    pub doc_names: Vec<String>,
     pub doc: String,
     pub chunks: MemoryChunks<MemoryThingFinal>,
     pub instances: Vec<PeripheralInstance>,
@@ -32,6 +34,7 @@ pub struct Peripheral {
 
 #[derive(Debug)]
 pub struct PeripheralInstance {
+    pub doc_names: Vec<String>,
     pub struct_name: Ident,
     pub page: u64,
     pub num: NonZeroU32,
@@ -118,7 +121,7 @@ impl Device {
 
         // populate instances
         for (idx, instance) in peripheral_instances.into_iter() {
-            peripherals[idx].instances.push(instance)
+            peripherals[idx].include_instance(instance)
         }
 
         Self {
@@ -137,18 +140,21 @@ impl Peripheral {
     ) -> Self {
         let name = peripheral_name(pers, page).to_string();
 
-        let docs: Vec<_> = pers
+        let doc = pers
             .iter()
             .map(|per| {
-                let name = per.display_name.as_ref().unwrap_or(&per.name);
+                let name = per.doc_name();
                 let description = per
                     .description
                     .as_ref()
                     .map(String::as_str)
-                    .unwrap_or("No Documentation");
-                format!("{name}: {description}")
+                    .map(str_to_doc)
+                    .unwrap_or("No Documentation".to_string());
+                format!("{name}: {description}<br>")
             })
+            .chain(["<br>Instances:<br>".to_string()].into_iter())
             .collect();
+        let doc_names = pers.iter().map(|per| per.doc_name()).collect();
         let mut context = ContextMemoryGen {
             svds: devices,
             pheriperals_name: &name,
@@ -160,18 +166,28 @@ impl Peripheral {
             name_struct: format_ident!("{}", camel_case(&name)),
             field_name: format_ident!("{}", snake_case(&name)),
             chunks: MemoryChunks::new_page(&mut context, pers),
-            doc: docs.join("\n"),
+            doc,
+            doc_names,
             // populated later
             instances: vec![],
         }
+    }
+
+    fn include_instance(&mut self, instance: PeripheralInstance) {
+        let page = instance.page;
+        let names = instance.doc_names.join(", ");
+        write!(self.doc, "0x{page:08x}: {names}<br>").unwrap();
+        self.instances.push(instance);
     }
 }
 
 impl PeripheralInstance {
     fn new(pers: &[&svd::Peripheral], page: u64, num: u32) -> Self {
+        let names = pers.iter().map(|per| per.doc_name()).collect();
         let struct_name =
             format_ident!("{}", camel_case(&peripheral_name(pers, page)));
         Self {
+            doc_names: names,
             struct_name,
             page,
             num: NonZeroU32::new(num).unwrap(),
@@ -206,20 +222,24 @@ impl Device {
             self.field_values.iter().map(EnumerationValues::gen_enum);
         // all the memory blocks
         tokens.extend(quote! {
+            #[doc = "All peripheral related data is contained here"]
             pub mod peripheral {
+                #[doc = "Values used for read/write by the peripheral fields"]
                 pub mod enums {
                     #(#enums_declare)*
                 }
                 #(#per_structs)*
+                #[doc = "Register read/write from pages, used for behavior affecting multiple peripherals"]
                 pub(crate) mod registers {
                     use icicle_vm::cpu::mem::{MemResult, MemError};
                     impl super::Peripherals {
                         #(#register_functions)*
                     }
                 }
+                #[doc = "A Global Peripheral device"]
                 #[derive(Default)]
                 pub struct Peripherals {
-                    #(pub #per_structs_fields,)*
+                    #(#per_structs_fields)*
                 }
             }
         });
@@ -255,6 +275,7 @@ impl Device {
             }
         });
         tokens.extend(quote! {
+            #[doc = "Map Peripherals to Icicle VM"]
             pub fn map_cpu(
                 _pe: &std::sync::Arc<std::sync::Mutex<peripheral::Peripherals>>,
                 _cpu: &mut icicle_vm::cpu::Cpu,
@@ -287,9 +308,23 @@ impl Peripheral {
         let field_name = &self.field_name;
         if num_instances > 1 {
             let num_instances = Literal::u32_unsuffixed(num_instances);
-            quote! { #field_name: [#peripheral_mod::#peripheral_struct; #num_instances] }
+            let inst_pages: Vec<_> = self
+                .instances
+                .iter()
+                .map(|instance| format!("0x{:08x}", instance.page))
+                .collect();
+            let doc = format!("Peripheral at {}", inst_pages.join(", "));
+            quote! {
+                #[doc = #doc]
+                pub #field_name: [#peripheral_mod::#peripheral_struct; #num_instances],
+            }
         } else {
-            quote! { #field_name: #peripheral_mod::#peripheral_struct }
+            let doc =
+                format!("Peripheral at 0x{:08x}", &self.instances[0].page);
+            quote! {
+                #[doc = #doc]
+                pub #field_name: #peripheral_mod::#peripheral_struct,
+            }
         }
     }
 
@@ -353,12 +388,23 @@ impl Peripheral {
     }
 }
 
+// TODO peripheral instance to index mapping function
 fn gen_struct_to_tokens(peripheral: &Peripheral, tokens: &mut TokenStream) {
     let mod_name = &peripheral.mod_name;
     let peripheral_struct = &peripheral.name_struct;
     let doc = &peripheral.doc;
     let peripheral_fields = peripheral.gen_fields_functions();
+    let doc_mod = format!(
+        "Peripheral{} {}",
+        if peripheral.doc_names.len() > 1 {
+            "s"
+        } else {
+            ""
+        },
+        peripheral.doc_names.join(", "),
+    );
     tokens.extend(quote! {
+        #[doc = #doc_mod]
         pub mod #mod_name {
             use icicle_vm::cpu::mem::MemResult;
             #[derive(Default)]
@@ -398,7 +444,7 @@ fn peripheral_name(
 ) -> Cow<'static, str> {
     if peripherals.len() == 1 {
         // Single peripheral, use it's name
-        Cow::Owned(dim_to_n(&peripherals[0].name().to_lowercase()))
+        Cow::Owned(dim_to_n(&peripherals[0].name.to_lowercase()))
     } else {
         let page = page >> ADDR_BITS;
         match page {
@@ -481,4 +527,12 @@ pub(crate) struct ContextCodeGen<'a> {
     pub peripheral: &'a Peripheral,
     pub clusters: Vec<&'a ClusterAccess>,
     pub register: Option<&'a RegisterAccess>,
+}
+
+impl ContextCodeGen<'_> {
+    pub fn doc_peripheral(&self) -> String {
+        let per_mod = &self.peripheral.mod_name;
+        let per_struct = &self.peripheral.name_struct;
+        format!("[crate::peripheral::{per_mod}::{per_struct}]")
+    }
 }

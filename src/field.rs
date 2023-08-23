@@ -1,13 +1,13 @@
 use proc_macro2::{Ident, TokenStream};
 use quote::format_ident;
 use svd_parser::svd::{
-    self, Access, Device, FieldInfo, MaybeArray, ModifiedWriteValues, Name,
-    ReadAction, RegisterProperties, WriteConstraint, DimElement,
+    self, Access, Device, DimElement, FieldInfo, MaybeArray,
+    ModifiedWriteValues, Name, ReadAction, RegisterProperties, WriteConstraint,
 };
 
 use crate::enumeration::{EnumerationValues, FieldRWType, FieldValue};
 use crate::formater::camel_case;
-use crate::helper;
+use crate::helper::{self, str_to_doc};
 use crate::memory::ContextMemoryGen;
 use crate::peripheral::{ContextCodeGen, EnumerationValuesId};
 
@@ -148,18 +148,22 @@ impl FieldAccess {
         );
         let enumerated_values =
             get_or_create_field_type(context, &name, &fields);
-        let docs: Vec<_> = fields
+        let doc = fields
             .iter()
             .filter_map(|field| {
-                Some(format!(
-                    "{}: {}",
-                    field.name(),
-                    field.description.as_ref()?,
-                ))
+                let name = str_to_doc(field.name());
+                let description = field
+                    .description
+                    .as_ref()
+                    .map(String::as_str)
+                    .map(str_to_doc)?;
+                Some(format!("{name}: {description}<br>"))
             })
             .collect();
-        let name_docs: Vec<_> =
-            fields.iter().map(|field| field.name()).collect();
+        let name_docs: Vec<_> = fields
+            .iter()
+            .map(|field| str_to_doc(field.name()))
+            .collect();
         Self {
             array,
             read,
@@ -174,7 +178,7 @@ impl FieldAccess {
             lsb: fields[0].lsb(),
             bit_width: fields[0].bit_width(),
             name_doc: name_docs.join(", "),
-            doc: docs.join("\n\n"),
+            doc,
         }
     }
     pub(crate) fn gen_function(
@@ -300,21 +304,25 @@ impl<T> FromIterator<(Option<svd::Usage>, T)> for EnumerateFieldType<T> {
 fn enumerated_field_type<'a>(
     context: &ContextMemoryGen<'a, '_>,
     fields: &[&'a svd::Field],
-) -> EnumerateFieldType<&'a svd::EnumeratedValue> {
+) -> EnumerateFieldType<(Option<&'a str>, &'a svd::EnumeratedValues)> {
     fields
         .iter()
         .flat_map(|f| f.enumerated_values.iter())
-        .flat_map(|mut ev| {
+        .map(|ev| {
+            let mut values = ev;
+            let mut name = ev.name.as_ref().map(String::as_str);
             if let Some(derived) = &ev.derived_from {
+                assert!(ev.values.is_empty());
                 let derived = find_enumerated_values(&context.svds, derived)
                     .expect("Unable to find enumerated_value derived");
+                name = name.or(derived.name.as_ref().map(String::as_str));
                 assert!(
                     derived.derived_from.is_none(),
                     "enumerated_value deriving other derivation"
                 );
-                ev = derived;
-            }
-            std::iter::repeat(ev.usage).zip(ev.values.iter())
+                values = derived;
+            };
+            (ev.usage, (name, values))
         })
         .collect()
 }
@@ -323,21 +331,31 @@ fn get_or_create_enumerated_values<'a>(
     context: &mut ContextMemoryGen<'a, '_>,
     bits: u32,
     field_name: &str,
-    fields: &[&'a svd::EnumeratedValue],
+    fields: &[(Option<&'a str>, &'a svd::EnumeratedValues)],
 ) -> EnumerationValuesId {
     //TODO use the pointer as an id?
     let field_name = camel_case(field_name);
     let fields_ids: Vec<_> = fields
         .into_iter()
-        .map(|value| (*value as *const svd::EnumeratedValue) as usize)
+        .map(|(_name, value)| (*value as *const svd::EnumeratedValues) as usize)
         .collect();
     get_enumerated_value_id(context, &fields_ids).unwrap_or_else(|| {
         let new_id = context.enumerated_values.len();
+        let doc = fields
+            .iter()
+            .filter_map(|(name, _field_values)| name.map(str_to_doc))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values: Vec<_> = fields
+            .iter()
+            .flat_map(|(_name, field_values)| field_values.values.iter())
+            .collect();
         context.enumerated_values.push(EnumerationValues {
             ids: fields_ids,
             bits,
             enum_name: format_ident!("E{new_id}{field_name}"),
-            values: FieldValue::combine_fields(fields),
+            values: FieldValue::combine_fields(&values),
+            doc,
         });
         EnumerationValuesId(new_id)
     })
