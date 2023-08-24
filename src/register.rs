@@ -12,8 +12,8 @@ use crate::field::{FieldAccess, FieldData};
 use crate::formater::{dim_to_n, snake_case};
 use crate::helper::{self, str_to_doc, DataType, Dim, DisplayName};
 use crate::memory::{
-    ContextMemoryGen, Memory, MemoryChunks, MemoryThingCondensated,
-    MemoryThingFinal,
+    ContextMemoryGen, Memory, MemoryChunks, MemoryThing,
+    MemoryThingCondensated, MemoryThingFinal,
 };
 use crate::peripheral::ContextCodeGen;
 
@@ -68,6 +68,27 @@ impl ClusterAccess {
     ) -> TokenStream {
         let stream = self.memory.gen_fields_functions(context);
         stream
+    }
+}
+
+impl MemoryThing for ClusterAccess {}
+impl Dim for ClusterAccess {
+    fn array(&self) -> Option<&DimElement> {
+        self.dim.as_ref().map(|(_, dim)| dim)
+    }
+}
+impl Memory for ClusterAccess {
+    fn len(&self) -> u64 {
+        crate::memory::memory_thing_len(self, self.memory.len())
+    }
+    fn offset(&self) -> u64 {
+        self.address_offset.into()
+    }
+    fn can_read(&self) -> bool {
+        self.memory.can_read()
+    }
+    fn can_write(&self) -> bool {
+        self.memory.can_write()
     }
 }
 

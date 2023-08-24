@@ -30,7 +30,7 @@ pub trait Memory {
 pub trait MemoryThing: Memory + Dim {}
 
 /// default implementation for Memory len for MemoryThing
-fn memory_thing_len(mem: &impl MemoryThing, mut len: u64) -> u64 {
+pub(crate) fn memory_thing_len(mem: &impl MemoryThing, mut len: u64) -> u64 {
     if let Some(dim) = mem.array() {
         len = dim.dim_increment as u64 * dim.dim as u64;
     }
@@ -762,26 +762,17 @@ impl ContextMemoryGen<'_, '_> {
 }
 
 impl MemoryChunks<MemoryThingFinal> {
-    pub(crate) fn gen_match_chunks<'a>(
-        &'a self,
-        context: &mut ContextCodeGen<'a>,
-        read: bool,
-        offset: u64,
-    ) -> TokenStream {
-        self.chunks
-            .iter()
-            .map(|chunk| chunk.gen_match_chunks(context, read, offset))
-            .collect()
-    }
     pub(crate) fn gen_chunks<'a>(
         &'a self,
         context: &mut ContextCodeGen<'a>,
         read: bool,
         offset: u64,
+        gen_code: impl FnMut((Range<u64>, TokenStream)) -> TokenStream,
     ) -> TokenStream {
         self.chunks
             .iter()
             .map(|chunk| chunk.gen_chunks(context, read, offset))
+            .map(gen_code)
             .collect()
     }
     pub(crate) fn gen_register_fun<'a>(
@@ -805,33 +796,13 @@ impl MemoryChunks<MemoryThingFinal> {
 }
 
 impl MemoryChunk<MemoryThingFinal> {
-    pub(crate) fn gen_match_chunks<'a>(
-        &'a self,
-        context: &mut ContextCodeGen<'a>,
-        read: bool,
-        offset: u64,
-    ) -> TokenStream {
-        let range = self.range();
-        let start = (range.start != 0)
-            .then_some(Literal::u64_unsuffixed(range.start + offset));
-        let end = Literal::u64_unsuffixed(range.end + offset);
-        let startp1 = Literal::u64_unsuffixed(range.start + 1 + offset);
-        let endm1 = Literal::u64_unsuffixed((range.end - 1) + offset);
-        //is somewhat common to have full blocks with only read/write
-        //permissions
-        let call = self.gen_chunks(context, read, offset);
-        quote! {
-            (#start..=#endm1, #startp1..=#end) => {
-                #call
-            },
-        }
-    }
     pub(crate) fn gen_chunks<'a>(
         &'a self,
         context: &mut ContextCodeGen<'a>,
         read: bool,
         offset: u64,
-    ) -> TokenStream {
+    ) -> (Range<u64>, TokenStream) {
+        let range = self.range();
         // is somewhat common to have full blocks with only read/write
         // permissions
         let available_block = self.things.iter().any(|thing| {
@@ -842,7 +813,7 @@ impl MemoryChunk<MemoryThingFinal> {
             }
         });
         // if no available read/write for this chunk, don't bother
-        if !available_block {
+        let stream = if !available_block {
             let error = if read {
                 quote! {ReadViolation}
             } else {
@@ -854,7 +825,8 @@ impl MemoryChunk<MemoryThingFinal> {
                 .iter()
                 .map(|thing| thing.gen_thing_mem_map(context, read, offset))
                 .collect()
-        }
+        };
+        (range.start + offset..range.end + offset, stream)
     }
 
     pub(crate) fn gen_register_functions<'a>(
@@ -902,7 +874,7 @@ impl MemoryThingFinal {
             .clusters
             .iter()
             .filter_map(|clu| clu.dim.as_ref())
-            .map(|(dim_name, _dim)| quote! {#dim_name});
+            .map(|(dim_name, _dim)| quote! {#dim_name as usize});
         let reg_use = self.array().map(|_array| quote! { _dim });
         let array_value = peripheral_use
             .into_iter()
@@ -913,26 +885,63 @@ impl MemoryThingFinal {
                 //TODO read/write only chunk do something?
                 if let Some((array_name, array)) = cluster.dim.as_ref() {
                     context.clusters.push(cluster);
-                    let mem = cluster.memory.gen_match_chunks(
-                        context,
-                        read,
-                        offset + self.offset(),
-                    );
-                    context.clusters.pop();
+                    let dim_lit = Literal::u32_unsuffixed(array.dim);
                     let len_lit = Literal::u32_unsuffixed(array.dim_increment);
-                    //TODO read between clusters
-                    quote! {
-                        let #array_name = ((_start - #offset_start_lit) % #len_lit) as usize;
-                        match (_start, _end) {
-                            #mem
-                            _ => return Err(MemError::Unmapped),
+                    let chunk_range = cluster.range();
+                    let chunk_start = offset + chunk_range.start;
+                    let chunk_start_lit = Literal::u64_unsuffixed(chunk_start);
+                    let chunk_end_lit =
+                        Literal::u64_unsuffixed(offset + chunk_range.end);
+                    let gen_cond = |(range, mem): (Range<u64>, _)| {
+                        let start = Literal::u64_unsuffixed(range.start);
+                        let end = Literal::u64_unsuffixed(range.end);
+                        quote! {
+                            if _start < #end && _end > #start {
+                                #mem
+                            }
                         }
-                    }
+                    };
+                    let chunks = cluster.memory.gen_chunks(
+                        context, read, 0, //offset + self.offset(),
+                        gen_cond,
+                    );
+                    let buf_ref = if read {
+                        quote! {&mut _buf}
+                    } else {
+                        quote! {&_buf}
+                    };
+                    let start = Literal::u64_unsuffixed(
+                        cluster.memory.range().start + offset + self.offset(),
+                    );
+                    let end = Literal::u64_unsuffixed(
+                        cluster.memory.range().end + offset + self.offset(),
+                    );
+                    let stream = quote! {
+                        if _start < #chunk_end_lit && _end > #chunk_start_lit {
+                            // check for each cluster instance
+                            for #array_name in 0..#dim_lit {
+                                // calculate the start end and buffer to read
+                                // for this chunk
+                                // TODO separate this into a function?
+                                let _dim_offset = #array_name * #len_lit;
+                                if _start < #end + _dim_offset
+                                    && _end > #start + _dim_offset {
+                                    let _start = #chunk_start.saturating_sub(_start);
+                                    let _end = _end - #chunk_start_lit;
+                                    let _buf = #buf_ref[_start as usize..];
+                                    #chunks
+                                }
+                            }
+                        }
+                    };
+                    context.clusters.pop();
+                    stream
                 } else {
                     cluster.memory.gen_chunks(
                         context,
                         read,
                         offset + self.offset(),
+                        |(_range, mem)| mem,
                     )
                 }
             }

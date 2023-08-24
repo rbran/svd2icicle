@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::num::NonZeroU32;
+use std::ops::Range;
 
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote};
@@ -401,8 +402,20 @@ impl Peripheral {
         let mod_name = &self.mod_name;
         let og_struct = &self.name_struct;
         let page_to_index = &self.page_to_index_function;
-        let write = self.chunks.gen_match_chunks(context, false, 0);
-        let read = self.chunks.gen_match_chunks(context, true, 0);
+        let chunks_to_match = |(range, mem): (Range<u64>, _)| {
+            let start = (range.start != 0)
+                .then_some(Literal::u64_unsuffixed(range.start));
+            let end = Literal::u64_unsuffixed(range.end);
+            let startp1 = Literal::u64_unsuffixed(range.start + 1);
+            let endm1 = Literal::u64_unsuffixed(range.end - 1);
+            quote! {
+                (#start..=#endm1, #startp1..=#end) => {
+                    #mem
+                },
+            }
+        };
+        let write = self.chunks.gen_chunks(context, false, 0, chunks_to_match);
+        let read = self.chunks.gen_chunks(context, true, 0, chunks_to_match);
         quote! {
             pub(crate) struct #pseudo_struct(
                 pub std::sync::Arc<
