@@ -69,7 +69,7 @@ pub(crate) fn read_write_field(
     let todo_msg = |read| {
         use std::fmt::Write;
         let mut output = format!(
-            "{} {name} mwrite {modified_write_values:?} write {write_constraint:?} rac {read_action:?} reset value",
+            "{} {name} mwrite {modified_write_values:?} write {write_constraint:?} rac {read_action:?} reset value ",
             if read { "read" } else { "write" },
         );
         if data.bits() == 1 {
