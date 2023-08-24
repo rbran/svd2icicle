@@ -198,8 +198,11 @@ impl RegisterAccess {
                 retain
             });
         }
-        let mut fields: Vec<_> = fields
-            .into_values()
+        // sorted to make it reproducible field_values ids
+        let mut fields: Vec<_> = fields.into_values().collect();
+        fields.sort_unstable_by_key(|fields| fields[0].lsb());
+        let fields: Vec<_> = fields
+            .into_iter()
             .map(|fields| {
                 // TODO compare field access with register access
                 FieldAccess::new(
@@ -212,7 +215,6 @@ impl RegisterAccess {
                 )
             })
             .collect();
-        fields.sort_unstable_by_key(|field| field.lsb);
 
         // TODO check for overlapping fields
 

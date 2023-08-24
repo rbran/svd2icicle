@@ -51,7 +51,10 @@ impl FieldValue {
                 .or_insert(vec![])
                 .push(field_value);
         }
-        let mut values: Vec<_> = field_values
+        // used to create predictable/reproduciable enum orders
+        let mut values: Vec<_> = field_values.into_iter().collect();
+        values.sort_unstable_by_key(|(v, _)| *v);
+        let mut values: Vec<_> = values
             .into_iter()
             .enumerate()
             .map(|(i, (value, fv))| {

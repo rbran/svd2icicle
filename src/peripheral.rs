@@ -126,6 +126,11 @@ impl Device {
             peripherals[idx].include_instance(instance)
         }
 
+        // sort peripherals instances to make the code reproducible
+        for peripheral in peripherals.iter_mut() {
+            peripheral.instances.sort_unstable_by_key(|i| i.page);
+        }
+
         Self {
             peripherals,
             field_values,
@@ -242,11 +247,8 @@ impl Device {
         tokens.extend(quote! {
             #[doc = "All peripheral related data is contained here"]
             pub mod peripheral {
-                #[doc = "Values used for read/write by the peripheral fields"]
-                pub mod enums {
-                    #(#enums_declare)*
-                }
                 #per_structs
+
                 #[doc = "Register read/write from pages, used for behavior affecting multiple peripherals"]
                 pub(crate) mod registers {
                     use icicle_vm::cpu::mem::{MemResult, MemError};
@@ -254,6 +256,11 @@ impl Device {
                         #(#register_functions)*
                     }
                 }
+                #[doc = "Values used for read/write by the peripheral fields"]
+                pub mod enums {
+                    #(#enums_declare)*
+                }
+
                 #[doc = "A Global Peripheral device"]
                 #[derive(Default)]
                 pub struct Peripherals {
