@@ -443,9 +443,9 @@ impl RegisterAccess {
                         FieldRWType::ReadWrite { .. }
                         | FieldRWType::Separated { .. } => quote! {
                             _value |= #value_type::from(
-                                self.#peripheral_field.#read(
+                                #field_type::from(self.#peripheral_field.#read(
                                     #(#dim_use,)*
-                                )? as #field_type
+                                )?)
                             ) #rotate;
                         },
                     }

@@ -92,10 +92,9 @@ impl EnumerationValues {
         let discriminants = self.values.iter().map(|value| {
             let doc = value.doc.as_str();
             let field = &value.name;
-            let value = Literal::u64_unsuffixed(value.value);
             quote! {
                 #[doc = #doc]
-                #field = #value,
+                #field,
             }
         });
         let values = self
@@ -104,6 +103,17 @@ impl EnumerationValues {
             .map(|value| Literal::u64_unsuffixed(value.value));
         let fields = self.values.iter().map(|value| &value.name);
 
+        let fields2 = fields.clone();
+        let values2 = values.clone();
+        let impl_into = quote! {
+            impl From<#name> for #data_type {
+                fn from(value: #name) -> #data_type {
+                    match value {
+                        #(#name::#fields2 => #values2,)*
+                    }
+                }
+            }
+        };
         let impl_from = if 2usize.pow(self.bits) == self.values.len() {
             quote! {
                 impl From<#data_type> for #name {
@@ -133,10 +143,10 @@ impl EnumerationValues {
         quote! {
             #doc
             #[derive(Debug, Clone, Copy)]
-            #[repr(#data_type)]
             pub enum #name {
                 #(#discriminants)*
             }
+            #impl_into
             #impl_from
         }
     }
