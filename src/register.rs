@@ -30,6 +30,7 @@ impl ClusterAccess {
     pub(crate) fn new<'a>(
         context: &mut ContextMemoryGen<'a, '_>,
         clusters: Vec<&'a MaybeArray<ClusterInfo>>,
+        address_offset: u32,
         memory: MemoryChunks<MemoryThingCondensated<'a>>,
     ) -> Self {
         let mut bytes = memory.len();
@@ -47,7 +48,7 @@ impl ClusterAccess {
             (ident, dim)
         });
         Self {
-            address_offset: clusters[0].address_offset,
+            address_offset,
             dim,
             bytes,
             memory,
@@ -113,6 +114,7 @@ impl RegisterAccess {
     pub(crate) fn new<'a>(
         context: &mut ContextMemoryGen<'a, '_>,
         properties: RegisterProperties,
+        address_offset: u32,
         registers: Vec<&'a svd::Register>,
     ) -> Self {
         // all register names, used for error messages
@@ -132,7 +134,7 @@ impl RegisterAccess {
         let reg_name = dim_to_n(&registers[0].name().to_owned()).to_lowercase();
         // NOTE address offset is used, because diferent registers, that dont
         // overlap, from diferent pheripherals, that overlap, have the same name
-        let reg_name = format!("{reg_name}{:x}", registers[0].address_offset);
+        let reg_name = format!("{reg_name}{address_offset:x}");
         let name = context.gen_register_fun_name(&reg_name);
         let read_fun = properties
             .access
@@ -254,7 +256,7 @@ impl RegisterAccess {
             modified_write_values,
             write_constraint,
             read_action,
-            address_offset: registers[0].address_offset,
+            address_offset,
             array: registers[0].array().cloned(),
             name,
             doc,

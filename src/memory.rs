@@ -83,10 +83,12 @@ impl<T: Clone> Clone for MemoryChunk<T> {
 enum MemoryThingSingle<'a> {
     Register {
         properties: RegisterProperties,
+        address_offset: u32,
         register: &'a MaybeArray<RegisterInfo>,
     },
     Cluster {
         cluster: &'a MaybeArray<ClusterInfo>,
+        address_offset: u32,
         memory: MemoryChunks<MemoryThingCondensated<'a>>,
     },
 }
@@ -95,10 +97,12 @@ enum MemoryThingSingle<'a> {
 pub(crate) enum MemoryThingCondensated<'a> {
     Register {
         properties: RegisterProperties,
+        address_offset: u32,
         registers: Vec<&'a MaybeArray<RegisterInfo>>,
     },
     Cluster {
         clusters: Vec<&'a MaybeArray<ClusterInfo>>,
+        address_offset: u32,
         memory: MemoryChunks<MemoryThingCondensated<'a>>,
     },
 }
@@ -246,8 +250,8 @@ impl Memory for MemoryThingSingle<'_> {
     }
     fn offset(&self) -> u64 {
         match self {
-            Self::Register { register, .. } => register.address_offset as u64,
-            Self::Cluster { cluster, .. } => cluster.address_offset as u64,
+            Self::Register { address_offset, .. }
+            | Self::Cluster { address_offset, .. } => *address_offset as u64,
         }
     }
 
@@ -282,10 +286,8 @@ impl Memory for MemoryThingCondensated<'_> {
     }
     fn offset(&self) -> u64 {
         match self {
-            Self::Register { registers, .. } => {
-                registers[0].address_offset as u64
-            }
-            Self::Cluster { clusters, .. } => clusters[0].address_offset as u64,
+            Self::Register { address_offset, .. }
+            | Self::Cluster { address_offset, .. } => *address_offset as u64,
         }
     }
     fn range(&self) -> Range<u64> {
@@ -306,13 +308,20 @@ impl<'a> From<MemoryThingSingle<'a>> for MemoryThingCondensated<'a> {
         match value {
             MemoryThingSingle::Register {
                 properties,
+                address_offset,
                 register,
             } => Self::Register {
                 properties,
+                address_offset,
                 registers: vec![register],
             },
-            MemoryThingSingle::Cluster { cluster, memory } => Self::Cluster {
+            MemoryThingSingle::Cluster {
+                cluster,
+                address_offset,
+                memory,
+            } => Self::Cluster {
                 clusters: vec![cluster],
+                address_offset,
                 memory,
             },
         }
@@ -331,8 +340,11 @@ impl MemoryChunks<MemoryThingFinal> {
                 // combine the defaults of the cluster with the parent
                 let defaults = &peripheral.default_register_properties;
                 // the base address is with the page as offset
+                let peripheral_offset =
+                    (peripheral.base_address % PAGE_LEN) as u32;
                 MemoryChunks::new_chunk(
                     defaults,
+                    peripheral_offset,
                     peripheral.registers(),
                     peripheral.clusters(),
                 )
@@ -360,20 +372,26 @@ impl MemoryChunks<MemoryThingFinal> {
 impl<'a> MemoryChunks<MemoryThingCondensated<'a>> {
     fn new_chunk<'b>(
         defaults: &'b RegisterProperties,
-        registers: impl Iterator<Item = &'a MaybeArray<RegisterInfo>> + 'b,
-        clusters: impl Iterator<Item = &'a MaybeArray<ClusterInfo>> + 'b,
+        peripheral_offset: u32,
+        registers: impl Iterator<Item = &'a svd::Register> + 'b,
+        clusters: impl Iterator<Item = &'a svd::Cluster> + 'b,
     ) -> impl Iterator<Item = MemoryThingSingle<'a>> + 'b {
-        let registers = registers.map(|register| {
+        let registers = registers.map(move |register| {
             let properties = register_chunk(register, defaults);
             MemoryThingSingle::Register {
                 properties,
+                address_offset: register.address_offset + peripheral_offset,
                 register,
             }
         });
 
-        let clusters = clusters.map(|cluster| {
+        let clusters = clusters.map(move |cluster| {
             let memory = cluster_chunks(cluster, defaults);
-            MemoryThingSingle::Cluster { cluster, memory }
+            MemoryThingSingle::Cluster {
+                cluster,
+                memory,
+                address_offset: cluster.address_offset + peripheral_offset,
+            }
         });
         registers.chain(clusters)
     }
@@ -415,13 +433,24 @@ impl<'a> MemoryThingCondensated<'a> {
         match self {
             Self::Register {
                 properties,
+                address_offset,
                 registers,
             } => MemoryThingFinal::Register(RegisterAccess::new(
-                context, properties, registers,
+                context,
+                properties,
+                address_offset,
+                registers,
             )),
-            Self::Cluster { clusters, memory } => MemoryThingFinal::Cluster(
-                ClusterAccess::new(context, clusters, memory),
-            ),
+            Self::Cluster {
+                clusters,
+                address_offset,
+                memory,
+            } => MemoryThingFinal::Cluster(ClusterAccess::new(
+                context,
+                clusters,
+                address_offset,
+                memory,
+            )),
         }
     }
 }
@@ -502,7 +531,8 @@ fn merge_overlapping_chunks<'a>(
     thing: MemoryThingSingle<'a>,
 ) {
     // just need to check the last one, because they are sorted by offset
-    let Some((things_i, off)) = find_offset_in_chunk(last, thing.offset()) else {
+    let Some((things_i, off)) = find_offset_in_chunk(last, thing.offset())
+    else {
         panic!("Invalid chunk overlapping")
     };
     let last_thing = &mut last.things[things_i];
@@ -532,20 +562,23 @@ fn merge_overlapping_chunks<'a>(
         // register overlap with other inside this cluster
         (
             Consdensated::Cluster {
-                clusters, memory, ..
+                clusters,
+                memory,
+                address_offset,
+                ..
             },
             Single::Register {
                 register,
                 properties,
+                address_offset: reg_offset,
             },
         ) if clusters[0].is_one() => {
-            let offset_diff = register.address_offset as u64
-                - clusters[0].address_offset as u64;
+            let offset_diff = reg_offset - *address_offset;
             merge_overlapping_register(
                 memory,
                 register,
                 properties.size.unwrap() as u64,
-                offset_diff,
+                offset_diff as u64,
             );
         }
         // two cluster could be contain one another, in this case, just merge the
@@ -626,13 +659,16 @@ fn merge_overlapping_register<'a>(
     register_bytes: u64,
     offset: u64,
 ) {
-    let Some((chunk_i, thing_i, chunk_offset)) = find_offset_in_chunks(&mem.chunks, offset) else {
+    let Some((chunk_i, thing_i, chunk_offset)) =
+        find_offset_in_chunks(&mem.chunks, offset)
+    else {
         unreachable!()
     };
     let chunk = &mut mem.chunks[chunk_i];
     match &mut chunk.things[thing_i] {
         MemoryThingCondensated::Register {
             properties,
+            address_offset: _,
             registers,
         } => {
             if properties.size.unwrap() as u64 != register_bytes {
@@ -704,6 +740,7 @@ fn cluster_chunks<'a>(
 
     let things = MemoryChunks::new_chunk(
         &properties,
+        0,
         cluster.registers(),
         cluster.clusters(),
     )
