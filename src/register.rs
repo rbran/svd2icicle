@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use svd_parser::svd::{
-    self, ClusterInfo, DimElement, MaybeArray, ModifiedWriteValues, ReadAction,
-    RegisterProperties, WriteConstraint,
+    self, DimElement, ModifiedWriteValues, ReadAction, RegisterProperties,
+    WriteConstraint,
 };
 
 use crate::enumeration::FieldRWType;
@@ -12,50 +12,70 @@ use crate::field::{FieldAccess, FieldData};
 use crate::formater::{dim_to_n, snake_case};
 use crate::helper::{self, str_to_doc, DataType, Dim, DisplayName};
 use crate::memory::{
-    ContextMemoryGen, Memory, MemoryChunks, MemoryThing,
-    MemoryThingCondensated, MemoryThingFinal,
+    ContextMemoryGen, MemoryChunks, MemoryThingCondensated, MemoryThingFinal,
 };
 use crate::peripheral::ContextCodeGen;
 
-#[derive(Debug)]
-pub struct ClusterAccess {
-    pub bytes: u64,
+#[derive(Debug, Clone)]
+pub(crate) struct ClusterAccess {
     //pub clusters: Vec<&'a MaybeArray<ClusterInfo>>,
     pub address_offset: u32,
-    pub dim: Option<(Ident, DimElement)>,
+    pub array: Option<DimElement>,
+    pub array_num_var: Ident,
+    pub total_len: u64,
     pub memory: MemoryChunks<MemoryThingFinal>,
 }
 
 impl ClusterAccess {
-    pub(crate) fn new<'a>(
+    pub fn new<'a>(
         context: &mut ContextMemoryGen<'a, '_>,
-        clusters: Vec<&'a MaybeArray<ClusterInfo>>,
+        clusters: Vec<&'a svd::Cluster>,
         address_offset: u32,
         memory: MemoryChunks<MemoryThingCondensated<'a>>,
     ) -> Self {
-        let mut bytes = memory.len();
-        if let Some(dim) = clusters[0].array() {
-            bytes = dim.dim as u64 * dim.dim_increment as u64;
-        }
-
         context.clusters.push(clusters);
         let memory = memory.finalize(context);
         let clusters = context.clusters.pop().unwrap();
 
-        let dim = clusters[0].array().cloned().map(|dim| {
-            let name = snake_case(&dim_to_n(&clusters[0].name).to_lowercase());
-            let ident = format_ident!("_{name}");
-            (ident, dim)
-        });
+        let array = helper::dim_from_multiple(&clusters).cloned();
+        // TODO what cluster name to use?
+        let name = snake_case(&dim_to_n(&clusters[0].name.to_lowercase()));
+        let array_num_var = format_ident!("_{name}");
+        let total_len = if let Some(dim) = &array {
+            dim.dim as u64 * dim.dim_increment as u64
+        } else {
+            memory.len()
+        };
         Self {
             address_offset,
-            dim,
-            bytes,
+            array,
+            array_num_var,
             memory,
+            total_len,
         }
     }
 
-    pub(crate) fn gen_register_functions<'a>(
+    pub fn len_total(&self) -> u64 {
+        self.total_len
+    }
+    pub fn len_element(&self) -> u64 {
+        if let Some(array) = &self.array {
+            array.dim_increment as u64
+        } else {
+            self.memory.len()
+        }
+    }
+    pub fn offset(&self) -> u64 {
+        self.address_offset.into()
+    }
+    pub fn can_read(&self) -> bool {
+        self.memory.can_read()
+    }
+    pub fn can_write(&self) -> bool {
+        self.memory.can_write()
+    }
+
+    pub fn gen_register_functions<'a>(
         &'a self,
         context: &mut ContextCodeGen<'a>,
     ) -> TokenStream {
@@ -63,7 +83,7 @@ impl ClusterAccess {
         stream
     }
 
-    pub(crate) fn gen_fields_functions<'a>(
+    pub fn gen_fields_functions<'a>(
         &'a self,
         context: &mut ContextCodeGen<'a>,
     ) -> TokenStream {
@@ -72,29 +92,14 @@ impl ClusterAccess {
     }
 }
 
-impl MemoryThing for ClusterAccess {}
 impl Dim for ClusterAccess {
-    fn array(&self) -> Option<&DimElement> {
-        self.dim.as_ref().map(|(_, dim)| dim)
-    }
-}
-impl Memory for ClusterAccess {
-    fn len(&self) -> u64 {
-        crate::memory::memory_thing_len(self, self.memory.len())
-    }
-    fn offset(&self) -> u64 {
-        self.address_offset.into()
-    }
-    fn can_read(&self) -> bool {
-        self.memory.can_read()
-    }
-    fn can_write(&self) -> bool {
-        self.memory.can_write()
+    fn array(&self) -> Option<(u32, u32)> {
+        self.array.as_ref().map(|dim| (dim.dim, dim.dim_increment))
     }
 }
 
-#[derive(Debug)]
-pub struct RegisterAccess {
+#[derive(Debug, Clone)]
+pub(crate) struct RegisterAccess {
     pub read_fun: Option<Ident>,
     pub write_fun: Option<Ident>,
     pub name: String,
@@ -111,7 +116,7 @@ pub struct RegisterAccess {
 }
 
 impl RegisterAccess {
-    pub(crate) fn new<'a>(
+    pub fn new<'a>(
         context: &mut ContextMemoryGen<'a, '_>,
         properties: RegisterProperties,
         address_offset: u32,
@@ -131,7 +136,7 @@ impl RegisterAccess {
         };
 
         // generate the names
-        let reg_name = dim_to_n(&registers[0].name().to_owned()).to_lowercase();
+        let reg_name = dim_to_n(&registers[0].name().to_lowercase());
         // NOTE address offset is used, because diferent registers, that dont
         // overlap, from diferent pheripherals, that overlap, have the same name
         let reg_name = format!("{reg_name}{address_offset:x}");
@@ -168,9 +173,9 @@ impl RegisterAccess {
             reset_value & reset_mask,
             |clean, field| {
                 let mut bit_width = field.bit_width();
-                if let Some(array) = field.array() {
-                    assert_eq!(array.dim_increment, bit_width);
-                    bit_width *= array.dim;
+                if let Some((array_num, array_inc)) = field.array() {
+                    assert_eq!(array_inc, bit_width);
+                    bit_width *= array_num;
                 }
                 let bits = u64::MAX >> (u64::BITS - bit_width);
                 let mask = bits << field.lsb();
@@ -248,6 +253,7 @@ impl RegisterAccess {
             })
             .collect();
 
+        let array = helper::dim_from_multiple(&registers).cloned();
         Self {
             read_fun,
             write_fun,
@@ -257,7 +263,7 @@ impl RegisterAccess {
             write_constraint,
             read_action,
             address_offset,
-            array: registers[0].array().cloned(),
+            array,
             name,
             doc,
             fields,
@@ -268,7 +274,19 @@ impl RegisterAccess {
         self.fields.is_empty()
     }
 
-    pub(crate) fn gen_fields_functions<'a>(
+    pub fn len_element(&self) -> u32 {
+        self.properties.size.unwrap() / 8
+    }
+
+    pub fn len_total(&self) -> u64 {
+        let mut len = self.len_element() as u64;
+        if let Some(array) = &self.array {
+            len *= array.dim as u64;
+        }
+        len
+    }
+
+    pub fn gen_fields_functions<'a>(
         &'a self,
         context: &mut ContextCodeGen<'a>,
         tokens: &mut TokenStream,
@@ -287,7 +305,7 @@ impl RegisterAccess {
                 &self.name,
                 self.read_fun.as_ref(),
                 self.write_fun.as_ref(),
-                FieldData::from_bytes(self.properties.size.unwrap() / 8),
+                FieldData::from_bytes(self.len_element()),
                 self.properties.reset_value.unwrap_or(0),
                 self.properties.reset_mask.unwrap_or(0),
                 &self.doc,
@@ -300,7 +318,7 @@ impl RegisterAccess {
         }
     }
 
-    pub(crate) fn gen_register_function(
+    pub fn gen_register_function(
         &self,
         context: &mut ContextCodeGen,
         tokens: &mut TokenStream,
@@ -321,21 +339,19 @@ impl RegisterAccess {
         let peripheral_field =
             quote! { #peripheral_struct_field #peripheral_instance_index };
 
-        let cluster_instance_declare = context
-            .clusters
-            .iter()
-            .filter_map(|clu| clu.dim.as_ref())
-            .map(|(dim_name, _dim)| quote! {#dim_name: usize});
+        let array_index_name = context.clusters.iter().filter_map(|clu| {
+            clu.array.is_some().then_some(&clu.array_num_var)
+        });
+        let cluster_instance_declare = array_index_name
+            .clone()
+            .map(|dim_name| quote! {#dim_name: usize});
         let register_instance_declare =
             self.array().map(|_dim| quote! {_reg_array: usize});
         let dim_declare =
             cluster_instance_declare.chain(register_instance_declare);
 
-        let cluster_instance_use = context
-            .clusters
-            .iter()
-            .filter_map(|clu| clu.dim.as_ref())
-            .map(|(dim_name, _dim)| quote! {#dim_name});
+        let cluster_instance_use =
+            array_index_name.clone().map(|dim_name| quote! {#dim_name});
         let register_instance_use =
             self.array().map(|_dim| quote! {_reg_array});
         let dim_use = cluster_instance_use.chain(register_instance_use);
@@ -377,7 +393,7 @@ impl RegisterAccess {
                 tokens.extend(quote! {
                     #[doc = #doc]
                     #[inline]
-                    pub(crate) fn #read(
+                    pub fn #read(
                         &mut self,
                         #peripheral_instance_declare
                         #(#dim_declare,)*
@@ -415,7 +431,7 @@ impl RegisterAccess {
                 tokens.extend(quote! {
                     #[doc = #doc]
                     #[inline]
-                    pub(crate) fn #write(
+                    pub fn #write(
                         &mut self,
                         #peripheral_instance_declare
                         #(#dim_declare,)*
@@ -459,7 +475,7 @@ impl RegisterAccess {
                     // NOTE no comma on dim_declare
                     #[doc = #doc]
                     #[inline]
-                    pub(crate) fn #read(
+                    pub fn #read(
                         &mut self,
                         #peripheral_instance_declare
                         #(#dim_declare,)*
@@ -582,7 +598,7 @@ impl RegisterAccess {
                     // NOTE no comma on dim_declare
                     #[doc = #doc]
                     #[inline]
-                    pub(crate) fn #write(
+                    pub fn #write(
                         &mut self,
                         #peripheral_instance_declare
                         #(#dim_declare,)*
@@ -604,21 +620,19 @@ impl RegisterAccess {
         context: &mut ContextCodeGen,
         tokens: &mut TokenStream,
     ) {
-        let cluster_instance_declare = context
-            .clusters
-            .iter()
-            .filter_map(|clu| clu.dim.as_ref())
-            .map(|(dim_name, _dim)| quote! {#dim_name: usize});
+        let array_index_name = context.clusters.iter().filter_map(|clu| {
+            clu.array.is_some().then_some(&clu.array_num_var)
+        });
+        let cluster_instance_declare = array_index_name
+            .clone()
+            .map(|dim_name| quote! {#dim_name: usize});
         let register_instance_declare =
             self.array().map(|_dim| quote! {_reg_array: usize});
         let dim_declare =
             cluster_instance_declare.chain(register_instance_declare);
 
-        let cluster_instance_use = context
-            .clusters
-            .iter()
-            .filter_map(|clu| clu.dim.as_ref())
-            .map(|(dim_name, _dim)| quote! {#dim_name});
+        let cluster_instance_use =
+            array_index_name.clone().map(|dim_name| quote! {#dim_name});
         let register_instance_use =
             self.array().map(|_dim| quote! {_reg_array});
         let dim_use = cluster_instance_use.chain(register_instance_use);
@@ -656,7 +670,7 @@ impl RegisterAccess {
             tokens.extend(quote! {
                 #[doc = #doc]
                 #[inline]
-                pub(crate) fn #read(
+                pub fn #read(
                     &mut self,
                     #peripheral_instance_declare
                     #(#dim_declare,)*
@@ -673,7 +687,7 @@ impl RegisterAccess {
             tokens.extend(quote! {
                 #[doc = #doc]
                 #[inline]
-                pub(crate) fn #write(
+                pub fn #write(
                     &mut self,
                     #peripheral_instance_declare
                     #(#dim_declare,)*
@@ -694,7 +708,7 @@ impl RegisterAccess {
 }
 
 impl Dim for RegisterAccess {
-    fn array(&self) -> Option<&DimElement> {
-        self.array.as_ref()
+    fn array(&self) -> Option<(u32, u32)> {
+        self.array.as_ref().map(|dim| (dim.dim, dim.dim_increment))
     }
 }

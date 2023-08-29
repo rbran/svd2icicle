@@ -9,7 +9,7 @@ use crate::helper::{self, str_to_doc};
 use crate::peripheral::EnumerationValuesId;
 
 #[derive(Debug)]
-pub struct EnumerationValues {
+pub(crate) struct EnumerationValues {
     // list of unique-ids for enumerations combined to create this struct.
     // For now the id is just the mem address, TODO use a more elegant id.
     pub ids: Vec<usize>,
@@ -19,8 +19,8 @@ pub struct EnumerationValues {
     pub values: Vec<FieldValue>,
 }
 
-#[derive(Debug, Default)]
-pub enum FieldRWType {
+#[derive(Debug, Default, Clone)]
+pub(crate) enum FieldRWType {
     #[default]
     Nothing,
     ReadWrite {
@@ -33,14 +33,14 @@ pub enum FieldRWType {
 }
 
 #[derive(Debug)]
-pub struct FieldValue {
+pub(crate) struct FieldValue {
     value: u64,
     name: Ident,
     doc: String,
 }
 
 impl FieldValue {
-    pub(crate) fn combine_fields(
+    pub fn combine_fields(
         values: &[&svd::EnumeratedValue],
     ) -> Vec<Self> {
         let mut field_values = HashMap::new();

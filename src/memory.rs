@@ -1,48 +1,24 @@
 use std::ops::Range;
 
-use proc_macro2::{Literal, TokenStream};
+use proc_macro2::{Ident, Literal, TokenStream};
 use quote::quote;
 use svd_parser::svd::{
-    self, ClusterInfo, DimElement, MaybeArray, Name, RegisterInfo,
-    RegisterProperties,
+    self, ClusterInfo, MaybeArray, Name, RegisterInfo, RegisterProperties,
 };
 
 use crate::enumeration::EnumerationValues;
 use crate::formater::dim_to_n;
-use crate::helper::Dim;
+use crate::helper::{self, Dim};
 use crate::peripheral::ContextCodeGen;
 use crate::register::{ClusterAccess, RegisterAccess};
 use crate::PAGE_LEN;
 
-pub trait Memory {
-    /// memory len in bytes
-    fn len(&self) -> u64;
-    /// start of the memory, in bytes, in relation what contains this memory
-    fn offset(&self) -> u64;
-    fn can_read(&self) -> bool;
-    fn can_write(&self) -> bool;
-    /// start and end of the memory in bytes
-    fn range(&self) -> Range<u64> {
-        self.offset()..self.offset() + self.len()
-    }
-}
-
-pub trait MemoryThing: Memory + Dim {}
-
-/// default implementation for Memory len for MemoryThing
-pub(crate) fn memory_thing_len(mem: &impl MemoryThing, mut len: u64) -> u64 {
-    if let Some(dim) = mem.array() {
-        len = dim.dim_increment as u64 * dim.dim as u64;
-    }
-    len
-}
-
-#[derive(Debug)]
-pub struct MemoryChunks<T> {
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryChunks<T: Clone> {
     chunks: Vec<MemoryChunk<T>>,
 }
 
-impl<T> Default for MemoryChunks<T> {
+impl<T: Clone> Default for MemoryChunks<T> {
     fn default() -> Self {
         Self {
             chunks: Default::default(),
@@ -50,20 +26,12 @@ impl<T> Default for MemoryChunks<T> {
     }
 }
 
-impl<T: Clone> Clone for MemoryChunks<T> {
-    fn clone(&self) -> Self {
-        Self {
-            chunks: self.chunks.clone(),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct MemoryChunk<T> {
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryChunk<T: Clone> {
     things: Vec<T>,
 }
 
-impl<T> Default for MemoryChunk<T> {
+impl<T: Clone> Default for MemoryChunk<T> {
     fn default() -> Self {
         Self {
             things: Default::default(),
@@ -71,24 +39,16 @@ impl<T> Default for MemoryChunk<T> {
     }
 }
 
-impl<T: Clone> Clone for MemoryChunk<T> {
-    fn clone(&self) -> Self {
-        Self {
-            things: self.things.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum MemoryThingSingle<'a> {
     Register {
         properties: RegisterProperties,
-        address_offset: u32,
+        addr_offset: u32,
         register: &'a MaybeArray<RegisterInfo>,
     },
     Cluster {
         cluster: &'a MaybeArray<ClusterInfo>,
-        address_offset: u32,
+        addr_offset: u32,
         memory: MemoryChunks<MemoryThingCondensated<'a>>,
     },
 }
@@ -97,18 +57,18 @@ enum MemoryThingSingle<'a> {
 pub(crate) enum MemoryThingCondensated<'a> {
     Register {
         properties: RegisterProperties,
-        address_offset: u32,
-        registers: Vec<&'a MaybeArray<RegisterInfo>>,
+        addr_offset: u32,
+        registers: Vec<&'a svd::Register>,
     },
     Cluster {
-        clusters: Vec<&'a MaybeArray<ClusterInfo>>,
-        address_offset: u32,
+        clusters: Vec<&'a svd::Cluster>,
+        addr_offset: u32,
         memory: MemoryChunks<MemoryThingCondensated<'a>>,
     },
 }
 
-#[derive(Debug)]
-pub enum MemoryThingFinal {
+#[derive(Debug, Clone)]
+pub(crate) enum MemoryThingFinal {
     Register(RegisterAccess),
     Cluster(ClusterAccess),
 }
@@ -122,23 +82,29 @@ pub(crate) struct ContextMemoryGen<'a, 'b> {
     pub clusters: Vec<Vec<&'a MaybeArray<ClusterInfo>>>,
 }
 
-impl Memory for MemoryThingFinal {
-    fn len(&self) -> u64 {
-        let bytes = match self {
-            Self::Register(reg) => reg.properties.size.unwrap() as u64 / 8,
-            Self::Cluster(clu) => clu.memory.len(),
-        };
-        memory_thing_len(self, bytes)
+impl MemoryThingFinal {
+    pub fn len_element(&self) -> u64 {
+        match self {
+            Self::Register(reg) => reg.len_element() as u64,
+            Self::Cluster(clu) => clu.len_element(),
+        }
     }
 
-    fn offset(&self) -> u64 {
+    pub fn len_total(&self) -> u64 {
+        match self {
+            Self::Register(reg) => reg.len_total(),
+            Self::Cluster(clu) => clu.len_total(),
+        }
+    }
+
+    pub fn offset(&self) -> u64 {
         match self {
             Self::Register(reg) => reg.address_offset as u64,
             Self::Cluster(clu) => clu.address_offset as u64,
         }
     }
 
-    fn can_read(&self) -> bool {
+    pub fn can_read(&self) -> bool {
         match self {
             Self::Register(reg) => {
                 reg.properties.access.unwrap_or_default().can_read()
@@ -147,7 +113,7 @@ impl Memory for MemoryThingFinal {
         }
     }
 
-    fn can_write(&self) -> bool {
+    pub fn can_write(&self) -> bool {
         match self {
             Self::Register(reg) => {
                 reg.properties.access.unwrap_or_default().can_write()
@@ -158,15 +124,13 @@ impl Memory for MemoryThingFinal {
 }
 
 impl Dim for MemoryThingFinal {
-    fn array(&self) -> Option<&DimElement> {
+    fn array(&self) -> Option<(u32, u32)> {
         match self {
-            Self::Register(reg) => reg.array.as_ref(),
-            Self::Cluster(clu) => clu.dim.as_ref().map(|x| &x.1),
+            Self::Register(reg) => reg.array(),
+            Self::Cluster(clu) => clu.array(),
         }
     }
 }
-
-impl MemoryThing for MemoryThingFinal {}
 
 impl core::fmt::Debug for MemoryThingCondensated<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -182,124 +146,197 @@ impl core::fmt::Debug for MemoryThingCondensated<'_> {
     }
 }
 
-impl<T: Memory> Memory for MemoryChunks<T> {
-    fn len(&self) -> u64 {
-        self.chunks.iter().map(|thing| thing.len()).sum()
+impl MemoryChunks<MemoryThingFinal> {
+    pub fn len(&self) -> u64 {
+        let Some(first) = self.chunks.first() else {
+            return 0;
+        };
+        let last = self.chunks.last().unwrap();
+        (last.offset() + last.len()) - first.offset()
     }
-    fn offset(&self) -> u64 {
-        0
-    }
-    fn can_read(&self) -> bool {
+    pub fn can_read(&self) -> bool {
         self.chunks
             .iter()
             .map(|chunk| chunk.can_read())
             .reduce(|a, b| a | b)
             .unwrap_or(true)
     }
-    fn can_write(&self) -> bool {
+    pub fn can_write(&self) -> bool {
         self.chunks
             .iter()
             .map(|chunk| chunk.can_write())
             .reduce(|a, b| a | b)
             .unwrap_or(true)
     }
+
+    fn offset(&self) -> u64 {
+        self.chunks.first().map(|chunk| chunk.offset()).unwrap_or(0)
+    }
 }
 
-impl<T: Memory> Memory for MemoryChunk<T> {
+impl MemoryChunk<MemoryThingFinal> {
     fn len(&self) -> u64 {
-        self.things.iter().map(|thing| thing.len()).sum()
+        let Some(first) = self.things.first() else {
+            return 0;
+        };
+        let last = self.things.last().unwrap();
+        (last.offset() + last.len_total()) - first.offset()
     }
     fn offset(&self) -> u64 {
-        self.things[0].offset()
+        self.things.first().map(|chunk| chunk.offset()).unwrap_or(0)
     }
-    fn can_read(&self) -> bool {
+    pub fn can_read(&self) -> bool {
         self.things
             .iter()
             .map(|things| things.can_read())
             .reduce(|a, b| a | b)
             .unwrap_or(true)
     }
-    fn can_write(&self) -> bool {
+    pub fn can_write(&self) -> bool {
         self.things
             .iter()
             .map(|things| things.can_write())
             .reduce(|a, b| a | b)
             .unwrap_or(true)
     }
+
+    fn range(&self) -> Range<u64> {
+        self.offset()..self.offset() + self.len()
+    }
+}
+
+impl MemoryThingSingle<'_> {
+    fn len_element(&self) -> u64 {
+        match self {
+            Self::Register { properties, .. } => {
+                properties.size.unwrap() as u64 / 8
+            }
+            Self::Cluster {
+                memory, cluster, ..
+            } => {
+                if let Some((_dim, dim_len)) = cluster.array() {
+                    dim_len.into()
+                } else {
+                    memory.len()
+                }
+            }
+        }
+    }
+
+    fn len_total(&self) -> u64 {
+        let mut len = self.len_element();
+        if let Some((dim, _)) = self.array() {
+            len *= dim as u64;
+        }
+        len
+    }
+
+    fn page_offset(&self) -> u64 {
+        match self {
+            Self::Register {
+                addr_offset: page_offset,
+                ..
+            }
+            | Self::Cluster {
+                addr_offset: page_offset,
+                ..
+            } => *page_offset as u64,
+        }
+    }
 }
 
 impl Dim for MemoryThingSingle<'_> {
-    fn array(&self) -> Option<&DimElement> {
+    fn array(&self) -> Option<(u32, u32)> {
         match self {
             Self::Register { register, .. } => register.array(),
             Self::Cluster { cluster, .. } => cluster.array(),
         }
     }
 }
-impl MemoryThing for MemoryThingSingle<'_> {}
 
-impl Memory for MemoryThingSingle<'_> {
-    fn len(&self) -> u64 {
-        let bytes = match self {
+impl<'a> MemoryThingCondensated<'a> {
+    fn offset(&self) -> u64 {
+        match self {
+            Self::Register { addr_offset, .. }
+            | Self::Cluster { addr_offset, .. } => *addr_offset as u64,
+        }
+    }
+    fn len_element(&self) -> u64 {
+        match self {
             Self::Register { properties, .. } => {
                 properties.size.unwrap() as u64 / 8
             }
-            Self::Cluster { memory, .. } => memory.len(),
-        };
-        memory_thing_len(self, bytes)
+            Self::Cluster {
+                memory, clusters, ..
+            } => {
+                if let Some(dim) = helper::dim_from_multiple(&clusters) {
+                    dim.dim_increment.into()
+                } else {
+                    memory.len()
+                }
+            }
+        }
     }
-    fn offset(&self) -> u64 {
+    fn len_total(&self) -> u64 {
+        let mut len = self.len_element();
+        if let Some((dim, _)) = self.array() {
+            len *= dim as u64;
+        }
+        len
+    }
+    fn page_offset(&self) -> u64 {
         match self {
-            Self::Register { address_offset, .. }
-            | Self::Cluster { address_offset, .. } => *address_offset as u64,
+            Self::Register {
+                addr_offset: page_offset,
+                ..
+            }
+            | Self::Cluster {
+                addr_offset: page_offset,
+                ..
+            } => *page_offset as u64,
         }
     }
 
-    fn can_read(&self) -> bool {
-        unreachable!()
-    }
-
-    fn can_write(&self) -> bool {
-        unreachable!()
+    fn finalize<'b>(
+        self,
+        context: &mut ContextMemoryGen<'a, 'b>,
+    ) -> MemoryThingFinal {
+        match self {
+            Self::Register {
+                properties,
+                addr_offset: address_offset,
+                registers,
+            } => MemoryThingFinal::Register(RegisterAccess::new(
+                context,
+                properties,
+                address_offset,
+                registers,
+            )),
+            Self::Cluster {
+                clusters,
+                addr_offset: address_offset,
+                memory,
+            } => MemoryThingFinal::Cluster(ClusterAccess::new(
+                context,
+                clusters,
+                address_offset,
+                memory,
+            )),
+        }
     }
 }
 
 impl Dim for MemoryThingCondensated<'_> {
-    fn array(&self) -> Option<&DimElement> {
+    fn array(&self) -> Option<(u32, u32)> {
         match self {
-            Self::Register { registers, .. } => registers[0].array(),
-            Self::Cluster { clusters, .. } => clusters[0].array(),
-        }
-    }
-}
-impl MemoryThing for MemoryThingCondensated<'_> {}
-
-impl Memory for MemoryThingCondensated<'_> {
-    fn len(&self) -> u64 {
-        let bytes = match self {
-            Self::Register { properties, .. } => {
-                properties.size.unwrap() as u64 / 8
+            Self::Register { registers, .. } => {
+                helper::dim_from_multiple(&registers)
             }
-            Self::Cluster { memory, .. } => memory.len(),
-        };
-        memory_thing_len(self, bytes)
-    }
-    fn offset(&self) -> u64 {
-        match self {
-            Self::Register { address_offset, .. }
-            | Self::Cluster { address_offset, .. } => *address_offset as u64,
+            Self::Cluster { clusters, .. } => {
+                helper::dim_from_multiple(&clusters)
+            }
         }
-    }
-    fn range(&self) -> Range<u64> {
-        self.offset()..self.offset() + self.len()
-    }
-
-    fn can_read(&self) -> bool {
-        unreachable!()
-    }
-
-    fn can_write(&self) -> bool {
-        unreachable!()
+        .map(|dim| (dim.dim, dim.dim_increment))
     }
 }
 
@@ -308,20 +345,20 @@ impl<'a> From<MemoryThingSingle<'a>> for MemoryThingCondensated<'a> {
         match value {
             MemoryThingSingle::Register {
                 properties,
-                address_offset,
+                addr_offset: address_offset,
                 register,
             } => Self::Register {
                 properties,
-                address_offset,
+                addr_offset: address_offset,
                 registers: vec![register],
             },
             MemoryThingSingle::Cluster {
                 cluster,
-                address_offset,
+                addr_offset: address_offset,
                 memory,
             } => Self::Cluster {
                 clusters: vec![cluster],
-                address_offset,
+                addr_offset: address_offset,
                 memory,
             },
         }
@@ -329,7 +366,7 @@ impl<'a> From<MemoryThingSingle<'a>> for MemoryThingCondensated<'a> {
 }
 
 impl MemoryChunks<MemoryThingFinal> {
-    pub(crate) fn new_page<'a>(
+    pub fn new_page<'a>(
         context: &mut ContextMemoryGen<'a, '_>,
         peripherals: &[&'a svd::Peripheral],
     ) -> Self {
@@ -358,7 +395,7 @@ impl MemoryChunks<MemoryThingFinal> {
         chunks
     }
 
-    pub(crate) fn gen_fields_functions<'a>(
+    pub fn gen_fields_functions<'a>(
         &'a self,
         context: &mut ContextCodeGen<'a>,
     ) -> TokenStream {
@@ -380,7 +417,7 @@ impl<'a> MemoryChunks<MemoryThingCondensated<'a>> {
             let properties = register_chunk(register, defaults);
             MemoryThingSingle::Register {
                 properties,
-                address_offset: register.address_offset + peripheral_offset,
+                addr_offset: register.address_offset + peripheral_offset,
                 register,
             }
         });
@@ -390,15 +427,21 @@ impl<'a> MemoryChunks<MemoryThingCondensated<'a>> {
             MemoryThingSingle::Cluster {
                 cluster,
                 memory,
-                address_offset: cluster.address_offset + peripheral_offset,
+                addr_offset: cluster.address_offset + peripheral_offset,
             }
         });
         registers.chain(clusters)
     }
-}
 
-impl<'a> MemoryChunks<MemoryThingCondensated<'a>> {
-    pub(crate) fn finalize<'b>(
+    pub fn len(&self) -> u64 {
+        let Some(first) = self.chunks.first() else {
+            return 0;
+        };
+        let last = self.chunks.last().unwrap();
+        (last.offset() + last.len()) - first.offset()
+    }
+
+    pub fn finalize<'b>(
         self,
         context: &mut ContextMemoryGen<'a, 'b>,
     ) -> MemoryChunks<MemoryThingFinal> {
@@ -412,6 +455,16 @@ impl<'a> MemoryChunks<MemoryThingCondensated<'a>> {
 }
 
 impl<'a> MemoryChunk<MemoryThingCondensated<'a>> {
+    fn len(&self) -> u64 {
+        let Some(first) = self.things.first() else {
+            return 0;
+        };
+        let last = self.things.last().unwrap();
+        (last.offset() + last.len_total()) - first.offset()
+    }
+    fn offset(&self) -> u64 {
+        self.things.first().map(|chunk| chunk.offset()).unwrap_or(0)
+    }
     fn finalize<'b>(
         self,
         context: &mut ContextMemoryGen<'a, 'b>,
@@ -425,36 +478,6 @@ impl<'a> MemoryChunk<MemoryThingCondensated<'a>> {
     }
 }
 
-impl<'a> MemoryThingCondensated<'a> {
-    fn finalize<'b>(
-        self,
-        context: &mut ContextMemoryGen<'a, 'b>,
-    ) -> MemoryThingFinal {
-        match self {
-            Self::Register {
-                properties,
-                address_offset,
-                registers,
-            } => MemoryThingFinal::Register(RegisterAccess::new(
-                context,
-                properties,
-                address_offset,
-                registers,
-            )),
-            Self::Cluster {
-                clusters,
-                address_offset,
-                memory,
-            } => MemoryThingFinal::Cluster(ClusterAccess::new(
-                context,
-                clusters,
-                address_offset,
-                memory,
-            )),
-        }
-    }
-}
-
 /// merge multiple chunks that are sequential, dsigned to be used only once
 /// to avoid the complexity of merging chunks that are more then one
 /// MemoryChunkType
@@ -464,15 +487,13 @@ fn condensate_chunks<'a>(
     // sort chunks so lowest address comes first, also but biggest first to
     // optimize the algorithm below.
     things.sort_unstable_by(|a, b| {
-        let a = a.range();
-        let b = b.range();
-        match a.start.cmp(&b.start) {
-            std::cmp::Ordering::Equal => b.end.cmp(&a.end),
+        match a.page_offset().cmp(&b.page_offset()) {
+            std::cmp::Ordering::Equal => b.len_total().cmp(&a.len_total()),
             x => x,
         }
     });
 
-    let mut chunks = vec![];
+    let mut chunks: Vec<MemoryChunk<MemoryThingCondensated<'a>>> = vec![];
     // combine multiple chunks into pages
     for thing in things.into_iter() {
         match chunks.last_mut() {
@@ -482,8 +503,8 @@ fn condensate_chunks<'a>(
             Some(last) => {
                 use core::cmp::Ordering::*;
                 // merge the chunks if they are intersecting/sequential
-                let last_end = last.range().end;
-                match last_end.cmp(&thing.offset()) {
+                let last_end = last.offset() + last.len();
+                match last_end.cmp(&thing.page_offset()) {
                     // the current chunk extend the last one, just concat it
                     Equal => last.things.push(thing.into()),
                     // overlapps with the last chunk
@@ -499,8 +520,8 @@ fn condensate_chunks<'a>(
     MemoryChunks { chunks }
 }
 
-fn find_offset_in_chunks<T: Memory>(
-    chunks: &[MemoryChunk<T>],
+fn find_offset_in_chunks(
+    chunks: &[MemoryChunk<MemoryThingCondensated>],
     offset: u64,
 ) -> Option<(usize, usize, u64)> {
     let chunk_i = chunks.iter().position(|chunk| chunk.offset() <= offset)?;
@@ -509,8 +530,8 @@ fn find_offset_in_chunks<T: Memory>(
     Some((chunk_i, things_i, off))
 }
 
-fn find_offset_in_chunk<T: Memory>(
-    chunk: &MemoryChunk<T>,
+fn find_offset_in_chunk(
+    chunk: &MemoryChunk<MemoryThingCondensated>,
     offset: u64,
 ) -> Option<(usize, u64)> {
     for (thing_i, thing) in chunk.things.iter().enumerate() {
@@ -519,7 +540,8 @@ fn find_offset_in_chunk<T: Memory>(
             return None;
         }
         // offset is in this chunk
-        if thing.range().contains(&offset) {
+        let thing_range = thing.offset()..thing.offset() + thing.len_total();
+        if thing_range.contains(&offset) {
             return Some((thing_i, offset - thing.offset()));
         }
     }
@@ -531,14 +553,14 @@ fn merge_overlapping_chunks<'a>(
     thing: MemoryThingSingle<'a>,
 ) {
     // just need to check the last one, because they are sorted by offset
-    let Some((things_i, off)) = find_offset_in_chunk(last, thing.offset())
+    let Some((things_i, off)) = find_offset_in_chunk(last, thing.page_offset())
     else {
         panic!("Invalid chunk overlapping")
     };
     let last_thing = &mut last.things[things_i];
     let same_start = off == 0;
-    let same_len = last_thing.len() == thing.len();
-    let last_greater = last_thing.len() > thing.len();
+    let same_len = last_thing.len_total() == thing.len_total();
+    let last_greater = last_thing.len_total() > thing.len_total();
     use MemoryThingCondensated as Consdensated;
     use MemoryThingSingle as Single;
     match (last_thing, thing) {
@@ -564,15 +586,15 @@ fn merge_overlapping_chunks<'a>(
             Consdensated::Cluster {
                 clusters,
                 memory,
-                address_offset,
+                addr_offset: address_offset,
                 ..
             },
             Single::Register {
                 register,
                 properties,
-                address_offset: reg_offset,
+                addr_offset: reg_offset,
             },
-        ) if clusters[0].is_one() => {
+        ) if helper::dim_from_multiple(clusters).is_none() => {
             let offset_diff = reg_offset - *address_offset;
             merge_overlapping_register(
                 memory,
@@ -598,7 +620,10 @@ fn merge_overlapping_chunks<'a>(
             clusters.push(cluster);
         }
         (_last_thing, _thing) => {
-            panic!("Invalid chunk overlapping types at {:08x}", _thing.offset())
+            panic!(
+                "Invalid chunk overlapping types at {:08x}",
+                _thing.page_offset()
+            )
         }
     }
 }
@@ -668,7 +693,7 @@ fn merge_overlapping_register<'a>(
     match &mut chunk.things[thing_i] {
         MemoryThingCondensated::Register {
             properties,
-            address_offset: _,
+            addr_offset: _,
             registers,
         } => {
             if properties.size.unwrap() as u64 != register_bytes {
@@ -705,14 +730,14 @@ fn register_chunk<'a>(
     };
     assert!(bits % 8 == 0);
     let bytes = (bits as u64 + 7) / 8;
-    if let Some(dim) = register.array() {
+    if let Some((_, dim_increment)) = register.array() {
         // TODO allow disconnected register dim? Just return one chunk for
         // each register
-        if dim.dim_increment as u64 != bytes {
+        if dim_increment as u64 != bytes {
             panic!(
                 "Register with disconnected dim {} {} != {}",
                 register.name(),
-                dim.dim_increment,
+                dim_increment,
                 bytes,
             );
         }
@@ -748,12 +773,12 @@ fn cluster_chunks<'a>(
     let mem = condensate_chunks(things);
 
     let len = mem.len();
-    if let Some(dim) = cluster.array() {
+    if let Some((_dim, dim_increment)) = cluster.array() {
         // TODO allow cluster to have empty spaces at the end?
         // if so the len is just the dim_increment
-        if (dim.dim_increment as u64) < len {
+        if (dim_increment as u64) < len {
             panic!(
-                "Cluster {} {len} bytes, with invalid dim {dim:#?}",
+                "Cluster {} {len} bytes, with invalid dim_len {dim_increment}",
                 cluster.name()
             );
         }
@@ -799,20 +824,19 @@ impl ContextMemoryGen<'_, '_> {
 }
 
 impl MemoryChunks<MemoryThingFinal> {
-    pub(crate) fn gen_chunks<'a>(
+    pub fn gen_chunks<'a>(
         &'a self,
         context: &mut ContextCodeGen<'a>,
         read: bool,
-        offset: u64,
         gen_code: impl FnMut((Range<u64>, TokenStream)) -> TokenStream,
     ) -> TokenStream {
         self.chunks
             .iter()
-            .map(|chunk| chunk.gen_chunks(context, read, offset))
+            .map(|chunk| (chunk.range(), chunk.gen_chunks(context, read)))
             .map(gen_code)
             .collect()
     }
-    pub(crate) fn gen_register_fun<'a>(
+    pub fn gen_register_fun<'a>(
         &'a self,
         context: &mut ContextCodeGen<'a>,
     ) -> TokenStream {
@@ -821,7 +845,7 @@ impl MemoryChunks<MemoryThingFinal> {
             .map(|chunk| chunk.gen_register_functions(context))
             .collect()
     }
-    pub(crate) fn gen_fields_fun<'a>(
+    pub fn gen_fields_fun<'a>(
         &'a self,
         context: &mut ContextCodeGen<'a>,
     ) -> TokenStream {
@@ -833,13 +857,11 @@ impl MemoryChunks<MemoryThingFinal> {
 }
 
 impl MemoryChunk<MemoryThingFinal> {
-    pub(crate) fn gen_chunks<'a>(
+    pub fn gen_chunks<'a>(
         &'a self,
         context: &mut ContextCodeGen<'a>,
         read: bool,
-        offset: u64,
-    ) -> (Range<u64>, TokenStream) {
-        let range = self.range();
+    ) -> TokenStream {
         // is somewhat common to have full blocks with only read/write
         // permissions
         let available_block = self.things.iter().any(|thing| {
@@ -850,7 +872,7 @@ impl MemoryChunk<MemoryThingFinal> {
             }
         });
         // if no available read/write for this chunk, don't bother
-        let stream = if !available_block {
+        if !available_block {
             let error = if read {
                 quote! {ReadViolation}
             } else {
@@ -860,13 +882,12 @@ impl MemoryChunk<MemoryThingFinal> {
         } else {
             self.things
                 .iter()
-                .map(|thing| thing.gen_thing_mem_map(context, read, offset))
+                .map(|thing| thing.gen_thing_mem_map(context, read))
                 .collect()
-        };
-        (range.start + offset..range.end + offset, stream)
+        }
     }
 
-    pub(crate) fn gen_register_functions<'a>(
+    pub fn gen_register_functions<'a>(
         &'a self,
         context: &mut ContextCodeGen<'a>,
     ) -> TokenStream {
@@ -892,155 +913,259 @@ impl MemoryThingFinal {
         &'a self,
         context: &mut ContextCodeGen<'a>,
         read: bool,
-        offset: u64,
     ) -> TokenStream {
-        let range = self.range();
-        let offset_start = range.start + offset;
-        let offset_end = range.end + offset;
-        let offset_start_lit = Literal::u64_unsuffixed(offset_start);
-        let offset_end_lit = Literal::u64_unsuffixed(offset_end);
-        let array_num = self.array().map(|array| {
-            let len_lit = Literal::u32_unsuffixed(array.dim_increment);
-            quote! {
-                let _dim = ((_start - #offset_start_lit) % #len_lit) as usize;
+        match self {
+            Self::Cluster(cluster) => {
+                context.clusters.push(cluster);
+                let result =
+                    self.gen_thing_mem_map_cluster(context, read, cluster);
+                context.clusters.pop();
+                result
             }
-        });
-        let peripheral_use = (context.peripheral.instances.len() > 1)
-            .then(|| quote! {_instance_page});
+            Self::Register(reg) => {
+                self.gen_thing_mem_map_register(context, read, reg)
+            }
+        }
+    }
+
+    fn gen_thing_mem_map_cluster<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+        read: bool,
+        cluster: &'a ClusterAccess,
+    ) -> TokenStream {
+        //TODO read/write only if the chunk do something?
+        // if not an array, just return a the simple mapping for the cluster
+        // inner mappings
+        let mem = if let Some((dim, dim_increment)) = cluster.array() {
+            self.gen_thing_mem_map_cluster_array(
+                context,
+                read,
+                cluster,
+                &cluster.array_num_var,
+                dim,
+                dim_increment,
+            )
+        } else {
+            // TODO this don't returns a error if a unmapped part of the cluster
+            // is read/write
+            cluster
+                .memory
+                .gen_chunks(context, read, |(_range, mem)| mem)
+        };
+        let chunk_start = cluster.offset();
+        let chunk_end = chunk_start + cluster.len_total();
+        let chunk_start_lit = Literal::u64_unsuffixed(chunk_start);
+        let chunk_end_lit = Literal::u64_unsuffixed(chunk_end);
+        let buf_ref = if read {
+            quote! {&mut _buf}
+        } else {
+            quote! {&_buf}
+        };
+        let bytes = Literal::u64_unsuffixed(self.len_total());
+        quote! {
+            if _start < #chunk_end_lit && _end > #chunk_start_lit {
+                // calculate the offset from the read to read from this chunk
+                let _offset_start = #chunk_start.saturating_sub(_start);
+                let _offset_end = _buf.len() as u64 - _end.saturating_sub(#chunk_end_lit);
+                let _buf = #buf_ref[_offset_start as usize.._offset_end as usize];
+                let _start = _start.saturating_sub(#chunk_start_lit);
+                let _end = (_start + _buf.len() as u64).max(#bytes);
+                #mem
+            }
+        }
+    }
+
+    fn gen_thing_mem_map_cluster_array<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+        read: bool,
+        cluster: &'a ClusterAccess,
+        array_name: &Ident,
+        dim: u32,
+        dim_increment: u32,
+    ) -> TokenStream {
+        let dim_lit = Literal::usize_suffixed(dim as usize);
+        let len_lit = Literal::u32_unsuffixed(dim_increment);
+        let gen_cond = |(range, mem): (Range<u64>, _)| {
+            let start = Literal::u64_unsuffixed(range.start);
+            let end = Literal::u64_unsuffixed(range.end);
+            quote! { if _start < #end && _end > #start { #mem } }
+        };
+        let chunks = cluster.memory.gen_chunks(context, read, gen_cond);
+        let buf_ref = if read {
+            quote! {&mut _buf}
+        } else {
+            quote! {&_buf}
+        };
+        let bytes = Literal::u64_unsuffixed(self.len_element());
+        quote! {
+            // check for each cluster instance
+            for #array_name in 0..#dim_lit {
+                // calculate the start end and buffer to read
+                // for this chunk
+                // TODO separate this into a function?
+                let _dim_offset = #array_name as u64 * #len_lit;
+                // TODO make the calculation to find the index to start/end
+                // don't use the if condition inside the loop to check if the
+                // read/write is in range
+                let _cluster_start = _dim_offset;
+                let _cluster_end = _cluster_start + #len_lit;
+                if _start < _cluster_end && _end > _cluster_start {
+                    let _offset_start = _cluster_start.saturating_sub(_start);
+                    let _offset_end = _buf.len() as u64 - _end.saturating_sub(_cluster_end);
+                    let _buf = #buf_ref[_offset_start as usize.._offset_end as usize];
+                    let _start = _start.saturating_sub(_cluster_start);
+                    let _end = (_start + _buf.len() as u64).max(#bytes);
+                    #chunks
+                }
+            }
+        }
+    }
+
+    fn gen_thing_mem_map_register<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+        read: bool,
+        reg: &'a RegisterAccess,
+    ) -> TokenStream {
+        let offset_start = self.offset();
+        let offset_start_lit = Literal::u64_unsuffixed(offset_start);
+        let offset_end_lit =
+            Literal::u64_unsuffixed(self.offset() + self.len_total());
+        if (read && reg.read_fun.is_none())
+            || (!read && reg.write_fun.is_none())
+        {
+            let error = if read {
+                quote! {ReadViolation}
+            } else {
+                quote! {WriteViolation}
+            };
+            return quote! {
+                if _start < #offset_end_lit && _end > #offset_start_lit {
+                    return Err(MemError::#error);
+                }
+            };
+        }
+        let call = if let Some((dim, dim_increment)) = self.array() {
+            self.gen_thing_mem_map_register_array(
+                context,
+                read,
+                reg,
+                dim,
+                dim_increment,
+            )
+        } else {
+            self.gen_thing_mem_map_register_call(context, read, reg)
+        };
+        let reg_start = reg.address_offset as u64;
+        let reg_start_lit = Literal::u64_unsuffixed(reg_start);
+        let buf_ref = if read {
+            quote! {&mut _buf}
+        } else {
+            quote! {&_buf}
+        };
+        let bytes = Literal::u64_unsuffixed(self.len_element());
+        quote! {
+            if _start < #offset_end_lit && _end > #offset_start_lit {
+                let _offset_start = #offset_start.saturating_sub(_start);
+                let _offset_end = _buf.len() as u64 - _end.saturating_sub(#offset_end_lit);
+                let _buf = #buf_ref[_offset_start as usize.._offset_end as usize];
+                let _start = _start.saturating_sub(#reg_start_lit);
+                let _end = (_start + _buf.len() as u64).max(#bytes);
+                #call
+            }
+        }
+    }
+
+    fn gen_thing_mem_map_register_array<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+        read: bool,
+        reg: &'a RegisterAccess,
+        dim: u32,
+        dim_increment: u32,
+    ) -> TokenStream {
+        let dim_lit = Literal::usize_suffixed(dim as usize);
+        let len_lit = Literal::u32_unsuffixed(dim_increment);
+        let buf_ref = if read {
+            quote! {&mut _buf}
+        } else {
+            quote! {&_buf}
+        };
+        let call = self.gen_thing_mem_map_register_call(context, read, reg);
+        quote! {
+            // check for each cluster instance
+            for _dim in 0..#dim_lit {
+                // calculate the start end and buffer to read
+                // for this chunk
+                // TODO separate this into a function?
+                let _dim_offset = _dim as u64 * #len_lit;
+                // TODO make the calculation to find the index to start/end
+                // don't use the if condition inside the loop to check if the
+                // read/write is in range
+                let _reg_start = _dim_offset;
+                let _reg_end = _reg_start + #len_lit;
+                if _start < _reg_end && _end > _reg_start {
+                    let _offset_start = _reg_start.saturating_sub(_start);
+                    let _offset_end = _buf.len() as u64 - _end.saturating_sub(_reg_end);
+                    let _buf = #buf_ref[_offset_start as usize.._offset_end as usize];
+                    let _start = _start.saturating_sub(_reg_start);
+                    let _end = (_end - _reg_end).min(#len_lit);
+                    let _end = (_start + _buf.len() as u64).max(#len_lit);
+                    #call
+                }
+            }
+        }
+    }
+
+    fn gen_thing_mem_map_register_call<'a>(
+        &'a self,
+        context: &mut ContextCodeGen<'a>,
+        read: bool,
+        reg: &'a RegisterAccess,
+    ) -> TokenStream {
         let context_use = context
             .clusters
             .iter()
-            .filter_map(|clu| clu.dim.as_ref())
-            .map(|(dim_name, _dim)| quote! {#dim_name as usize});
+            .filter(|clu| clu.array().is_some())
+            .map(|cluster| {
+                let dim_name = &cluster.array_num_var;
+                quote! {#dim_name as usize}
+            });
+        let peripheral_use = (context.peripheral.instances.len() > 1)
+            .then(|| quote! {_instance_page});
         let reg_use = self.array().map(|_array| quote! { _dim });
         let array_value = peripheral_use
             .into_iter()
             .chain(context_use)
             .chain(reg_use.into_iter());
-        match (read, self) {
-            (_, Self::Cluster(cluster)) => {
-                //TODO read/write only chunk do something?
-                if let Some((array_name, array)) = cluster.dim.as_ref() {
-                    context.clusters.push(cluster);
-                    let dim_lit = Literal::u32_unsuffixed(array.dim);
-                    let len_lit = Literal::u32_unsuffixed(array.dim_increment);
-                    let chunk_range = cluster.range();
-                    let chunk_start = offset + chunk_range.start;
-                    let chunk_start_lit = Literal::u64_unsuffixed(chunk_start);
-                    let chunk_end_lit =
-                        Literal::u64_unsuffixed(offset + chunk_range.end);
-                    let gen_cond = |(range, mem): (Range<u64>, _)| {
-                        let start = Literal::u64_unsuffixed(range.start);
-                        let end = Literal::u64_unsuffixed(range.end);
-                        quote! {
-                            if _start < #end && _end > #start {
-                                #mem
-                            }
-                        }
-                    };
-                    let chunks = cluster.memory.gen_chunks(
-                        context, read, 0, //offset + self.offset(),
-                        gen_cond,
-                    );
-                    let buf_ref = if read {
-                        quote! {&mut _buf}
-                    } else {
-                        quote! {&_buf}
-                    };
-                    let start = Literal::u64_unsuffixed(
-                        cluster.memory.range().start + offset + self.offset(),
-                    );
-                    let end = Literal::u64_unsuffixed(
-                        cluster.memory.range().end + offset + self.offset(),
-                    );
-                    let stream = quote! {
-                        if _start < #chunk_end_lit && _end > #chunk_start_lit {
-                            // check for each cluster instance
-                            for #array_name in 0..#dim_lit {
-                                // calculate the start end and buffer to read
-                                // for this chunk
-                                // TODO separate this into a function?
-                                let _dim_offset = #array_name * #len_lit;
-                                if _start < #end + _dim_offset
-                                    && _end > #start + _dim_offset {
-                                    let _start = #chunk_start.saturating_sub(_start);
-                                    let _end = _end - #chunk_start_lit;
-                                    let _buf = #buf_ref[_start as usize..];
-                                    #chunks
-                                }
-                            }
-                        }
-                    };
-                    context.clusters.pop();
-                    stream
-                } else {
-                    cluster.memory.gen_chunks(
-                        context,
-                        read,
-                        offset + self.offset(),
-                        |(_range, mem)| mem,
-                    )
+        if read {
+            let read = reg.read_fun.as_ref().unwrap();
+            // TODO read using the buffer, like in writing, so uncessary
+            // fields are not read
+            // TODO implement byte endian here
+            quote! {
+                let value = self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .#read(
+                        #(#array_value,)*
+                    )?
+                    .to_ne_bytes();
+                for _byte in _start.._end {
+                    _buf[_byte as usize] = value[_byte as usize];
                 }
             }
-            (true, Self::Register(reg)) => {
-                //TODO check for multiple dim from the the cluster
-                let call = if let Some(read) = reg.read_fun.as_ref() {
-                    let bytes = (offset_start..offset_end).enumerate().map(
-                        |(byte_i, byte)| {
-                            let byte = Literal::u64_unsuffixed(byte);
-                            let byte_i = Literal::usize_unsuffixed(byte_i);
-                            quote! {
-                                if _start <= #byte && _end > #byte {
-                                    _buf[(#byte - _start) as usize] =
-                                        value[#byte_i];
-                                }
-                            }
-                        },
-                    );
-                    // TODO implement byte endian here
-                    quote! {
-                        let value = self
-                            .0
-                            .lock()
-                            .unwrap()
-                            .#read(
-                                #(#array_value,)*
-                            )?
-                            .to_ne_bytes();
-                        #(#bytes)*
-                    }
-                } else {
-                    quote! { return Err(MemError::ReadViolation); }
-                };
-                quote! {
-                    if _start < #offset_end_lit && _end > #offset_start_lit {
-                        #array_num
-                        #call
-                    }
-                }
-            }
-            (false, Self::Register(reg)) => {
-                if let Some(write) = reg.write_fun.as_ref() {
-                    quote! {
-                        if _start < #offset_end_lit && _end > #offset_start_lit {
-                            #array_num
-                            let offset = _start.saturating_sub(#offset_start_lit);
-                            let start = #offset_start.saturating_sub(_start) as usize;
-                            let end = ((_end - #offset_start_lit) - offset) as usize;
-                            self.0.lock().unwrap().#write(
-                                #(#array_value,)*
-                                offset,
-                                &_buf[start..end],
-                            )?;
-                        }
-                    }
-                } else {
-                    quote! {
-                        if _start < #offset_end_lit && _end > #offset_start_lit {
-                            return Err(MemError::WriteViolation);
-                        }
-                    }
-                }
+        } else {
+            let write = reg.write_fun.as_ref().unwrap();
+            quote! {
+                self.0.lock().unwrap().#write(
+                    #(#array_value,)*
+                    _start,
+                    _buf,
+                )?;
             }
         }
     }

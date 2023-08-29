@@ -87,7 +87,7 @@ pub(crate) fn read_write_field(
     let cluster_instance_declare = context
         .clusters
         .iter()
-        .filter_map(|clu| clu.dim.as_ref())
+        .filter_map(|clu| clu.array())
         .map(|(dim_name, _dim)| quote! {#dim_name: usize});
     let register_instance_declare = context
         .register
@@ -143,22 +143,40 @@ pub(crate) fn read_write_field(
 }
 
 pub trait Dim {
-    fn array(&self) -> Option<&DimElement>;
-    fn is_one(&self) -> bool {
-        match self.array() {
-            Some(dim) => dim.dim == 1,
-            None => true,
+    fn array(&self) -> Option<(u32, u32)>;
+}
+
+impl<T> Dim for MaybeArray<T> {
+    fn array(&self) -> Option<(u32, u32)> {
+        match self {
+            MaybeArray::Single(_) => None,
+            MaybeArray::Array(_, dim) => Some((dim.dim, dim.dim_increment)),
         }
     }
 }
 
-impl<T> Dim for MaybeArray<T> {
-    fn array(&self) -> Option<&DimElement> {
-        match self {
-            MaybeArray::Single(_) => None,
-            MaybeArray::Array(_, dim) => Some(dim),
-        }
+impl<'a, T> Dim for dyn AsRef<[&'a MaybeArray<T>]> {
+    fn array(&self) -> Option<(u32, u32)> {
+        dim_from_multiple(self.as_ref()).map(|dim| (dim.dim, dim.dim_increment))
     }
+}
+
+pub fn dim_from_element<'a, T>(
+    element: &'a MaybeArray<T>,
+) -> Option<&'a DimElement> {
+    match element {
+        MaybeArray::Single(_) => None,
+        MaybeArray::Array(_, e) => Some(e),
+    }
+}
+
+pub fn dim_from_multiple<'a, T>(
+    elements: &[&'a MaybeArray<T>],
+) -> Option<&'a DimElement> {
+    elements
+        .iter()
+        .filter_map(|e| dim_from_element(*e))
+        .max_by_key(|dim| dim.dim)
 }
 
 fn stuff_need_to_be_equal<S: Eq + core::fmt::Debug>(

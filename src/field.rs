@@ -14,7 +14,7 @@ use crate::peripheral::{ContextCodeGen, EnumerationValuesId};
 /// Number of bits of the field, first byte bits, number of bytes and bits
 /// on the last byte
 #[derive(Debug, Clone, Copy)]
-pub enum FieldData {
+pub(crate) enum FieldData {
     Single(u32),
     Multiple { first: u32, bytes: u32, last: u32 },
 }
@@ -50,8 +50,8 @@ impl FieldData {
 }
 
 //TODO field could be an array
-#[derive(Debug)]
-pub struct FieldAccess {
+#[derive(Debug, Clone)]
+pub(crate) struct FieldAccess {
     pub array: Option<DimElement>,
     pub name_doc: String,
     pub read: Option<Ident>,
@@ -70,7 +70,7 @@ pub struct FieldAccess {
 }
 
 impl FieldAccess {
-    pub(crate) fn new<'a>(
+    pub fn new<'a>(
         context: &mut ContextMemoryGen<'a, '_>,
         properties: &RegisterProperties,
         fields: Vec<&'a MaybeArray<FieldInfo>>,
@@ -181,7 +181,7 @@ impl FieldAccess {
             doc,
         }
     }
-    pub(crate) fn gen_function(
+    pub fn gen_function(
         &self,
         context: &mut ContextCodeGen,
         tokens: &mut TokenStream,

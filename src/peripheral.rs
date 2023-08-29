@@ -10,20 +10,20 @@ use svd_parser::svd::{self, Name};
 
 use crate::enumeration::EnumerationValues;
 use crate::formater::{camel_case, dim_to_n, snake_case};
-use crate::helper::{str_to_doc, Dim, DisplayName};
+use crate::helper::{self, str_to_doc, DisplayName};
 use crate::memory::{ContextMemoryGen, MemoryChunks, MemoryThingFinal};
 use crate::register::{ClusterAccess, RegisterAccess};
 use crate::{ADDR_BITS, ADDR_MASK, PAGE_LEN, PAGE_MASK};
 
-pub struct Device {
+pub(crate) struct Device {
     pub peripherals: Vec<Peripheral>,
     pub field_values: Vec<EnumerationValues>,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct EnumerationValuesId(pub(crate) usize);
+pub(crate) struct EnumerationValuesId(pub(crate) usize);
 
-pub struct Peripheral {
+pub(crate) struct Peripheral {
     pub mod_name: Ident,
     pub name_struct: Ident,
     pub field_name: Ident,
@@ -66,7 +66,7 @@ impl Device {
         // instances that are not derived from other peripherals
         peripheral_instances.extend(peripherals.iter().enumerate().map(
             |(idx, (page, pers))| {
-                let dim = <svd::MaybeArray<_> as Dim>::array(&pers[0]);
+                let dim = helper::dim_from_multiple(&pers);
                 let num = dim.map(|dim| dim.dim_increment).unwrap_or(1);
                 if let Some(dim) = dim {
                     assert_eq!(dim.dim_increment as u64, PAGE_LEN);
@@ -84,7 +84,7 @@ impl Device {
                     page,
                     &deriveds,
                 );
-                let dim = deriveds[0].array();
+                let dim = helper::dim_from_multiple(&deriveds);
                 let page = deriveds[0].base_address & PAGE_MASK;
                 let num = dim.map(|dim| dim.dim_increment).unwrap_or(1);
                 if let Some(dim) = dim {
@@ -250,7 +250,7 @@ impl Device {
                 #per_structs
 
                 #[doc = "Register read/write from pages, used for behavior affecting multiple peripherals"]
-                pub(crate) mod registers {
+                pub mod registers {
                     use icicle_vm::cpu::mem::{MemResult, MemError};
                     impl super::Peripherals {
                         #(#register_functions)*
@@ -327,7 +327,7 @@ impl Peripheral {
                 quote! { #page => #index, }
             });
         quote! {
-            pub(crate) fn #function(page: u64) -> usize {
+            pub fn #function(page: u64) -> usize {
                 match page {
                     #(#page_instance)*
                     _ => unreachable!(),
@@ -421,10 +421,10 @@ impl Peripheral {
                 },
             }
         };
-        let write = self.chunks.gen_chunks(context, false, 0, chunks_to_match);
-        let read = self.chunks.gen_chunks(context, true, 0, chunks_to_match);
+        let write = self.chunks.gen_chunks(context, false, chunks_to_match);
+        let read = self.chunks.gen_chunks(context, true, chunks_to_match);
         quote! {
-            pub(crate) struct #pseudo_struct(
+            pub struct #pseudo_struct(
                 pub std::sync::Arc<
                     std::sync::Mutex<super::peripheral::Peripherals>
                 >,
