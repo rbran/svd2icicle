@@ -1,27 +1,17 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use svd2icicle::gen_empty_implementation;
 
 fn main() {
-    let svds = [
-        // core peripherals for cortex-m4
-        Path::new("/home/rbran/src/arm-generic-svd/Cortex-M4.svd"),
-        // the DWT
-        Path::new("/home/rbran/src/arm-generic-svd/Cortex-M4-DWT.svd"),
-        // peripherals for nrf52
-        Path::new("/home/rbran/src/nrf-pacs/svds/nrf52832.svd"),
-    ];
+    let mut args = std::env::args();
+    let _exec_file = args.next().unwrap();
+    let output_file = args.next().expect("Output file missing");
+    let files: Vec<_> = args.map(PathBuf::from).collect();
+    if files.is_empty() {
+        panic!("Input file(s) missing")
+    }
     gen_empty_implementation(
-        &svds,
-        Path::new("/home/rbran/src/icicle-nrf52832/src/lib.rs"),
-    );
-    assert_eq!(
-        std::process::Command::new("rustfmt")
-            .arg("/home/rbran/src/icicle-nrf52832/src/lib.rs")
-            .status()
-            .unwrap()
-            .code()
-            .unwrap(),
-        0
+        files.iter().map(PathBuf::as_path),
+        Path::new(&output_file),
     );
 }

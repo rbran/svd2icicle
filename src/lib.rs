@@ -16,9 +16,11 @@ pub const PAGE_LEN: u64 = 1 << ADDR_BITS;
 pub const PAGE_MASK: u64 = u64::MAX << ADDR_BITS;
 pub const ADDR_MASK: u64 = !PAGE_MASK;
 
-pub fn gen_empty_implementation(svds: &[&Path], lib_rs: &Path) {
+pub fn gen_empty_implementation<'a>(
+    svds: impl Iterator<Item = &'a Path>,
+    lib_rs: &Path,
+) {
     let svds = svds
-        .iter()
         .map(|svd| {
             let svd_data = std::fs::read_to_string(svd).unwrap();
             svd_parser::parse(&svd_data).unwrap()
